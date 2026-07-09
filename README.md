@@ -203,14 +203,17 @@ Re-run the benchmark with `node scripts/benchmark.mjs [runs]` (needs a
   no way for a client to recover it beyond resubmitting. Needs a real queue
   (or at least a persisted job record) before anything depends on jobs
   surviving a restart.
-- **No auth on the hosted API.** `server.js`'s original "not internet-facing"
-  assumption (see [Local API](#local-api)) is no longer true now that it's
-  deployed on Render with a public URL - anyone with the link can call
-  `/generate` and consume the shared `GEMINI_API_KEY` quota (the exact 429
-  the desktop app hit during testing is one bad actor away from being
-  trivial to trigger deliberately). Fine while the URL is unlisted during
-  mobile-app development; needs at least a shared-secret header or per-client
-  API key before sharing the URL more broadly.
+- **Shared-secret auth, not real per-user auth.** `/generate`,
+  `/status/:jobId`, and `/download/:jobId` now require an `X-API-Secret`
+  header matching `API_SHARED_SECRET` (see [Hosted API (Render)](#hosted-api-render)) -
+  closes off the open-quota-drain risk from the URL being public, but it's
+  one secret shared by every caller, not a per-user credential. Fine for a
+  single-owner mobile app talking to its own backend; would need real
+  per-user API keys (or a proper auth provider) the moment this has more
+  than one trusted caller. `/health` is intentionally exempt (no sensitive
+  operation, needed for uptime checks); `/debug/jobs` and
+  `/debug/jobs/:jobId` are **not** currently gated either, which is worth
+  revisiting since they do leak job data.
 
 ## Setup
 
@@ -362,14 +365,32 @@ binary present, failing the build before it ever got to `COPY server.js`.
 Fixed with `npm ci --omit=dev --ignore-scripts`.
 
 **Environment variables** (`GEMINI_API_KEY`, `GEMINI_MODEL`,
-`OPENAI_API_KEY`) are set through Render's dashboard, not committed -
-`render.yaml` marks the secrets `sync: false` so Render prompts for them on
-first deploy instead of reading them from this repo.
+`OPENAI_API_KEY`, `API_SHARED_SECRET`) are set through Render's dashboard,
+not committed - `render.yaml` marks the secrets `sync: false` so Render
+prompts for them on first deploy instead of reading them from this repo.
 
-**Verified for real**, not just "the build didn't error": `POST /generate`
-against the live URL with a real short video, polled `GET /status/:jobId`
-to `"stage":"done"`, then `GET /download/:jobId` - confirmed a genuine
-`application/pdf`-typed, 2-page PDF, not just a 200 with an empty body.
+**Auth**: `/generate`, `/status/:jobId`, and `/download/:jobId` require an
+`X-API-Secret` header matching `API_SHARED_SECRET` once that env var is set
+(see `requireApiSecret` in `server.js`, and the tradeoffs note above on why
+this is a shared secret rather than real per-user auth). `/health` doesn't
+need it:
+```bash
+curl -H "X-API-Secret: <the secret>" \
+  -X POST https://<host>/generate \
+  -H "Content-Type: application/json" \
+  -d '{"youtubeUrl":"https://www.youtube.com/watch?v=..."}'
+```
+A missing or wrong secret both just get a `401 {"error":"Unauthorized"}` -
+deliberately the same response either way, so the error message itself
+can't be used to guess whether a header was even present.
+
+**Verified for real**, not just "the build didn't error": hit the live URL
+without the header first (`401`, confirming the gate is actually live on
+the deployed instance, not just in local source), then with the correct
+header - `POST /generate` with a real short video, polled `GET
+/status/:jobId` to `"stage":"done"`, then `GET /download/:jobId` - confirmed
+a genuine `application/pdf`-typed, 2-page PDF, not just a 200 with an empty
+body.
 
 **Cold-start / spin-down behavior actually observed, not assumed:**
 - The free-tier instance spins down after idle and takes on the order of

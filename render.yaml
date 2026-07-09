@@ -2,9 +2,10 @@
 # only - the frontend/ and electron/ trees are excluded via .dockerignore
 # and aren't part of this service.
 #
-# Secrets (GEMINI_API_KEY, OPENAI_API_KEY) are intentionally left as
-# `sync: false` - Render will prompt for their values in the dashboard on
-# first deploy rather than reading them from this committed file.
+# Secrets (GEMINI_API_KEY, OPENAI_API_KEY, API_SHARED_SECRET) are
+# intentionally left as `sync: false` - Render will prompt for their values
+# in the dashboard on first deploy rather than reading them from this
+# committed file.
 services:
   - type: web
     name: notesify-api
@@ -18,6 +19,11 @@ services:
       - key: GEMINI_MODEL
         value: gemini-2.5-flash
       - key: OPENAI_API_KEY
+        sync: false
+      # Required on /generate, /status/:jobId, /download/:jobId via
+      # X-API-Secret header (see requireApiSecret in server.js). Left unset
+      # locally/in Electron on purpose - only Render needs this filled in.
+      - key: API_SHARED_SECRET
         sync: false
       - key: JOBS_OUTPUT_DIR
         value: /app/output/jobs

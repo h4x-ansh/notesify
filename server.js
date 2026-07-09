@@ -7,9 +7,11 @@ import { runPipeline } from "./src/pipeline.js";
 import { createJob, updateJob, getJob, listJobs } from "./src/jobStore.js";
 
 /**
- * Local-only API wrapping the same pipeline the CLI uses. This is meant to
- * run alongside a future UI (initially inside Electron) - not internet-
- * facing, so no auth/rate-limiting here on purpose.
+ * API wrapping the same pipeline the CLI uses. Runs two ways: spawned
+ * locally by the Electron app (see electron/main.js) with no auth needed,
+ * and deployed hosted on Render with a public URL for a future mobile app -
+ * see requireApiSecret below for the shared-secret gate that only applies
+ * to the latter.
  *
  * /generate kicks off runPipeline() without awaiting it (the pipeline takes
  * 30-60s+: transcript fetch, a Gemini call, then a Puppeteer render/print),
@@ -34,12 +36,28 @@ app.use(express.json());
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type");
+  res.header("Access-Control-Allow-Headers", "Content-Type, X-API-Secret");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-app.post("/generate", (req, res) => {
+// Shared-secret auth, gated on API_SHARED_SECRET being set at all. Unset
+// locally (CLI, dev, and the Electron app's locally-spawned backend - see
+// electron/main.js) so none of those flows need to know about this; set on
+// Render (see render.yaml) now that this same server.js is also deployed
+// with a public URL. A missing vs. wrong secret both just get a 401 - no
+// signal to a caller about which, since that itself is information.
+const API_SHARED_SECRET = process.env.API_SHARED_SECRET;
+
+function requireApiSecret(req, res, next) {
+  if (!API_SHARED_SECRET) return next();
+  if (req.header("X-API-Secret") !== API_SHARED_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
+
+app.post("/generate", requireApiSecret, (req, res) => {
   const { youtubeUrl } = req.body ?? {};
   if (!youtubeUrl || typeof youtubeUrl !== "string") {
     return res.status(400).json({ error: "youtubeUrl (string) is required" });
@@ -66,7 +84,7 @@ app.post("/generate", (req, res) => {
   res.status(202).json({ jobId: job.id });
 });
 
-app.get("/status/:jobId", (req, res) => {
+app.get("/status/:jobId", requireApiSecret, (req, res) => {
   const job = getJob(req.params.jobId);
   if (!job) return res.status(404).json({ error: "job not found" });
 
@@ -78,7 +96,7 @@ app.get("/status/:jobId", (req, res) => {
   });
 });
 
-app.get("/download/:jobId", (req, res) => {
+app.get("/download/:jobId", requireApiSecret, (req, res) => {
   const job = getJob(req.params.jobId);
   if (!job) return res.status(404).json({ error: "job not found" });
   if (job.stage !== "done") {
