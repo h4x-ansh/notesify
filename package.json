@@ -1,0 +1,37 @@
+{
+  "name": "hisarchives-notesify",
+  "version": "0.1.0",
+  "description": "YouTube lecture -> handwritten topper's-notebook style PDF notes, fully automated.",
+  "type": "module",
+  "main": "electron/main.js",
+  "bin": {
+    "generate-notes": "./generate-notes.js"
+  },
+  "scripts": {
+    "start": "node generate-notes.js",
+    "serve": "node server.js",
+    "build:css": "tailwindcss -i src/templates/tailwind-input.css -o src/templates/styles.css --minify",
+    "postinstall": "npm run build:css",
+    "electron": "electron .",
+    "build:frontend": "cd frontend && npm run build",
+    "electron:pack": "npm run build:frontend && electron-builder --config electron-builder.config.mjs --dir",
+    "electron:dist": "npm run build:frontend && electron-builder --config electron-builder.config.mjs"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "commander": "^12.1.0",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "puppeteer": "^23.10.4",
+    "youtube-transcript": "^1.2.1",
+    "zod": "^3.24.1"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "electron": "^41.7.1",
+    "electron-builder": "^26.15.3",
+    "tailwindcss": "^3.4.19"
+  }
+}

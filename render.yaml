@@ -1,0 +1,23 @@
+# Render Blueprint for the hosted API (see Dockerfile). Deploys server.js
+# only - the frontend/ and electron/ trees are excluded via .dockerignore
+# and aren't part of this service.
+#
+# Secrets (GEMINI_API_KEY, OPENAI_API_KEY) are intentionally left as
+# `sync: false` - Render will prompt for their values in the dashboard on
+# first deploy rather than reading them from this committed file.
+services:
+  - type: web
+    name: notesify-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: JOBS_OUTPUT_DIR
+        value: /app/output/jobs

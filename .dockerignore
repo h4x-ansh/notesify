@@ -1,0 +1,12 @@
+node_modules
+.env
+.env.local
+output
+*.pdf
+tmp
+dist
+frontend
+electron
+electron-builder.config.mjs
+.git
+*.md
