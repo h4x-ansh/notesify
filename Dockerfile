@@ -29,19 +29,18 @@ ENV PUPPETEER_SKIP_DOWNLOAD=true \
 
 WORKDIR /app
 
-# src/ is copied before `npm ci` because the postinstall hook (build:css)
-# runs tailwindcss against src/templates/tailwind-input.css during install -
-# it needs to already be present, not added in a later layer.
+# src/templates/styles.css is compiled from Tailwind and committed to git
+# (not gitignored) rather than built on install - see the performance-fix
+# work that introduced it. --ignore-scripts skips the postinstall hook
+# (`npm run build:css`), which would otherwise fail here: it needs the
+# tailwindcss CLI, a devDependency, and --omit=dev never installs it. This
+# also means only production dependencies are ever installed, so there's no
+# separate prune step needed afterward.
 COPY package*.json ./
 COPY src ./src
-RUN npm ci
+RUN npm ci --omit=dev --ignore-scripts
 
 COPY server.js generate-notes.js ./
-
-# tailwindcss itself (a devDependency) is only needed to produce
-# src/templates/styles.css during the postinstall step above - prune it and
-# the rest of devDependencies afterward to keep the runtime image smaller.
-RUN npm prune --omit=dev
 
 EXPOSE 4500
 CMD ["node", "server.js"]
