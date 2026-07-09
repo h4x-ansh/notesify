@@ -197,13 +197,20 @@ Re-run the benchmark with `node scripts/benchmark.mjs [runs]` (needs a
   term matching the "f" inside a previous match's own `font-bold` class
   name, corrupting the HTML).
 - **In-memory job store, no persistence.** `src/jobStore.js` is a `Map` -
-  fine for a local server backing an Electron app (this session's job list
-  doesn't need to survive a restart), but jobs vanish if the server
-  restarts mid-generation. Not a concern until this is ever hosted
-  multi-user, at which point it'd need a real queue anyway.
-- **No auth on the API.** Deliberate for now — `server.js` is explicitly
-  local-only (see [Local API](#local-api)), meant to run alongside an
-  Electron-packaged frontend, not to be internet-facing.
+  fine for the Electron app's locally-spawned backend, but now that the same
+  `server.js` is also deployed hosted (see [Hosted API (Render)](#hosted-api-render)),
+  a free-tier spin-down or redeploy silently drops every in-flight job with
+  no way for a client to recover it beyond resubmitting. Needs a real queue
+  (or at least a persisted job record) before anything depends on jobs
+  surviving a restart.
+- **No auth on the hosted API.** `server.js`'s original "not internet-facing"
+  assumption (see [Local API](#local-api)) is no longer true now that it's
+  deployed on Render with a public URL - anyone with the link can call
+  `/generate` and consume the shared `GEMINI_API_KEY` quota (the exact 429
+  the desktop app hit during testing is one bad actor away from being
+  trivial to trigger deliberately). Fine while the URL is unlisted during
+  mobile-app development; needs at least a shared-secret header or per-client
+  API key before sharing the URL more broadly.
 
 ## Setup
 
@@ -319,3 +326,60 @@ purely a hazard of testing from a shell that inherited it.
   Extremely likely on Windows (Edge is mandatory), but not guaranteed on a
   locked-down or stripped install - worth bundling a fallback copy if this
   ever needs to run on machines that can't be assumed to have either.
+
+## Hosted API (Render)
+
+The same `server.js` is also deployed as a standalone hosted service via
+`Dockerfile` + `render.yaml` - this is what a future mobile app talks to
+over the network, since it can't spawn Puppeteer locally the way the
+Electron app does. **This is a separate deployment; it doesn't affect or
+depend on the Electron app, which keeps using its own locally-spawned
+backend.**
+
+**Why Render, not Railway:** checked both against 2026 pricing before
+choosing. Railway removed its free tier in 2023/2024 - it's now a $5 trial
+credit then a $1/month minimum just to keep a service alive. Render still
+has a genuine free tier (750 instance-hours/month, 512MB RAM, Docker
+support), at the cost of spinning down after ~15 min idle.
+
+**Docker, not Render's native Node buildpack:** Puppeteer needs a real
+Chromium binary plus the OS-level libraries it links against (NSS, font
+rendering, etc.) - a buildpack that just runs `npm install` has no way to
+provide those. `Dockerfile` installs the Debian `chromium` package instead
+(pulls in its full dependency tree via `apt` automatically, rather than
+hand-listing ~15 individual `.so` libs for Puppeteer's own Chromium
+download) and points `PUPPETEER_EXECUTABLE_PATH` at it - the same
+system-browser approach `findSystemChromium()` uses for the desktop app,
+just via `apt` instead of probing Windows install paths.
+
+`src/templates/styles.css` (compiled Tailwind output, committed to git -
+see [Performance](#performance)) is copied in pre-built; the Docker build
+does **not** run `npm run build:css`, since that needs the `tailwindcss`
+CLI, a devDependency, which a production `npm ci --omit=dev` never
+installs. First version of this Dockerfile ran a plain `npm ci` and hit
+exactly that: `postinstall` firing `build:css` with no `tailwindcss`
+binary present, failing the build before it ever got to `COPY server.js`.
+Fixed with `npm ci --omit=dev --ignore-scripts`.
+
+**Environment variables** (`GEMINI_API_KEY`, `GEMINI_MODEL`,
+`OPENAI_API_KEY`) are set through Render's dashboard, not committed -
+`render.yaml` marks the secrets `sync: false` so Render prompts for them on
+first deploy instead of reading them from this repo.
+
+**Verified for real**, not just "the build didn't error": `POST /generate`
+against the live URL with a real short video, polled `GET /status/:jobId`
+to `"stage":"done"`, then `GET /download/:jobId` - confirmed a genuine
+`application/pdf`-typed, 2-page PDF, not just a 200 with an empty body.
+
+**Cold-start / spin-down behavior actually observed, not assumed:**
+- The free-tier instance spins down after idle and takes on the order of
+  30-60s to come back on the first request after a gap - expected, matches
+  Render's documented behavior.
+- More surprising: even on a freshly-deployed, already-warm instance,
+  roughly 1 in 5 requests to `/health` came back `404 Not Found` with an
+  `x-render-routing: no-server` header - a response from Render's edge
+  proxy, not from Express (no `x-powered-by: Express` on those responses).
+  This wasn't a one-time deploy-settling blip; it recurred across a 30s
+  sampling window well after the service reported "live." A client talking
+  to this API - the future mobile app included - needs to retry on 404/5xx
+  rather than treating a single failed request as authoritative.
