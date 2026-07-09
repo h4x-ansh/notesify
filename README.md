@@ -404,3 +404,43 @@ body.
   sampling window well after the service reported "live." A client talking
   to this API - the future mobile app included - needs to retry on 404/5xx
   rather than treating a single failed request as authoritative.
+
+**Known issue: intermittent caption-fetch failures on Render.** Investigated
+by running 17 `/generate` calls across 4 videos (2 that had worked earlier
+this session, 2 never used before) directly against the live instance.
+Findings ruled out the obvious theory:
+- **Not a simple IP block** - one video (Rick Astley, heavily cached/very
+  popular) succeeded 4/4 times; another ("Me at the zoo") failed 5/5 in the
+  same window. A hard block would fail everything uniformly.
+- **Not simply per-video either** - the same video (Gangnam Style) flipped
+  from success to failure on an immediate back-to-back repeat request,
+  which a purely video-specific cause (e.g. captions permanently disabled)
+  can't explain.
+- Best-supported explanation: something correlated with per-video/CDN
+  cache-tier variance in the `youtube-transcript` package's InnerTube/
+  webpage-scraping path, not a uniform Render-IP block.
+- The real underlying error was previously **unrecoverable even from this
+  process's own logs**: `src/transcript.js` swallowed it in a bare `catch {}`
+  with no logging at all, so every failure looked identical from the
+  outside regardless of cause. Fixed with diagnostic logging only (no
+  behavior change) - the real error type/message (the library throws typed
+  errors: captcha/too-many-requests, video-unavailable, captions-disabled,
+  no-transcript) now reaches Render's log stream, so the next occurrence is
+  a log read instead of a re-investigation.
+- The yt-dlp/Whisper fallback (`src/transcript.js`'s `transcribeViaAudioFallback`)
+  is untested on Render - every failure observed short-circuited on its
+  `OPENAI_API_KEY` presence check before yt-dlp ever ran, since that var
+  isn't set there.
+
+**Known constraint: Gemini free-tier daily quota (20 requests/day).**
+Discovered mid-investigation above - two attempts got past caption fetch
+fine and then hit `429 ... GenerateRequestsPerDayPerProjectPerModel-FreeTier`
+instead. This is a hard daily cap shared across *all* callers of the one
+`GEMINI_API_KEY`, unrelated to captions or Render entirely - it'll interrupt
+local dev, Electron, and hosted testing alike once enough requests have run
+that day, and resets on a 24h cycle, not a per-minute one. A single shared
+free-tier key is fine for solo testing; it will not scale once real users
+exist - a per-user "bring your own Gemini key" flow (raised, not yet
+designed) would sidestep this rather than paying for a shared quota - and
+is worth remembering before assuming a `429` here means something is
+broken.

@@ -82,8 +82,27 @@ export async function getTranscript(url) {
   try {
     const text = await fetchCaptions(url);
     if (text.trim().length > 0) return { text, source: "captions" };
-  } catch {
-    // fall through to audio transcription
+    // Fetch "succeeded" but produced no usable text - a different failure
+    // mode than the catch below (e.g. a caption track whose XML doesn't
+    // match either format parseTranscriptXml understands), previously
+    // indistinguishable from any other fallthrough since nothing logged it.
+    console.error(`[transcript] captions fetch returned empty text for ${url}`);
+  } catch (err) {
+    // youtube-transcript throws typed errors (TooManyRequests/captcha,
+    // VideoUnavailable, Disabled, NotAvailable, etc.) that used to be
+    // discarded here with a bare `catch {}` - every failure looked
+    // identical from the outside (a generic "no captions" message from the
+    // fallback below), with zero signal on which of those it actually was,
+    // even in this process's own logs. Logging the real error/type here is
+    // the fix for that blind spot, not for the underlying caption-fetch
+    // failures themselves - see the Render caption-fetch investigation in
+    // the README for what prompted this.
+    console.error(
+      `[transcript] captions fetch failed for ${url}:`,
+      err?.constructor?.name || "Error",
+      "-",
+      err?.message || String(err)
+    );
   }
 
   const text = await transcribeViaAudioFallback(url);
