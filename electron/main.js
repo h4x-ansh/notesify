@@ -1,10 +1,11 @@
-import { app, BrowserWindow } from "electron";
+import { app, BrowserWindow, ipcMain } from "electron";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { existsSync, appendFileSync, mkdirSync } from "node:fs";
 import dotenv from "dotenv";
 import express from "express";
+import { fetchCaptionsOnly } from "../src/transcript.js";
 
 /**
  * Packages the whole app (Express backend + static frontend export) as one
@@ -18,6 +19,12 @@ import express from "express";
  * in-process here - not loaded via win.loadFile(), because Next's static
  * export uses root-absolute asset paths (/_next/static/...) that don't
  * resolve under file://.
+ *
+ * A "fetch-transcript" IPC handler (see preload.cjs +
+ * frontend/lib/transcript.ts) lets the renderer fetch YouTube captions
+ * through the main process instead of the spawned backend - reuses
+ * src/transcript.js's fetchCaptionsOnly() as-is, same module the backend
+ * itself imports.
  *
  * PDF export needs a real Chromium to drive (see src/pdfExport.js). Rather
  * than bundling Puppeteer's own ~350MB download (roughly doubling install
@@ -122,6 +129,24 @@ if (existsSync(envFilePath)) {
   log("dotenv loaded:", result.error ? `ERROR: ${result.error}` : "ok");
 }
 
+// Lets the renderer fetch YouTube captions without going through the
+// spawned backend at all - see frontend/lib/transcript.ts's
+// window.notesifyBridge usage and electron/preload.cjs. Reuses
+// fetchCaptionsOnly() as-is (captions attempt only, no yt-dlp/Whisper -
+// that stays part of the backend's job pipeline, unchanged) since the main
+// process is plain Node, same as the spawned server.js, just running here
+// instead. This never actually had Render's IP-blocking problem (it's
+// always been the user's own local IP), but is wired up the same way as
+// the mobile build for one consistent client-side-first architecture.
+ipcMain.handle("fetch-transcript", async (_event, youtubeUrl) => {
+  try {
+    return await fetchCaptionsOnly(youtubeUrl);
+  } catch (err) {
+    log("[fetch-transcript IPC] failed:", err?.message || String(err));
+    return null;
+  }
+});
+
 let backendProcess = null;
 
 function startBackend() {
@@ -182,6 +207,7 @@ function createWindow() {
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
+      preload: path.join(__dirname, "preload.cjs"),
     },
   });
   win.webContents.on("did-fail-load", (_e, code, desc, url) => log("did-fail-load:", String(code), desc, url));

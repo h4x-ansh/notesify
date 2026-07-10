@@ -16,13 +16,26 @@ import { exportHtmlToPdf } from "./pdfExport.js";
  * (stage/progress plus stage-specific metadata). The CLI turns these into
  * console lines; the API forwards them straight into the job store so
  * GET /status/:jobId reflects progress in near-real-time.
+ *
+ * `preFetchedTranscript` lets a caller skip getTranscript() entirely when
+ * the transcript was already fetched elsewhere - specifically, client-side
+ * in the browser/WebView (see server.js's /generate and the frontend's
+ * lib/transcript.ts), done to dodge Render's blocked IP for caption
+ * fetches. When absent (client-side fetch wasn't attempted, or failed),
+ * this falls through to the exact same server-side captions-then-yt-dlp
+ * flow as before - the yt-dlp/Whisper fallback stays server-side either way.
  */
-export async function runPipeline(youtubeUrl, outputPath, { onUpdate = () => {} } = {}) {
+export async function runPipeline(youtubeUrl, outputPath, { onUpdate = () => {}, preFetchedTranscript = null } = {}) {
   try {
     await mkdir(path.dirname(outputPath), { recursive: true });
 
-    onUpdate({ stage: "extracting_transcript", progress: 5 });
-    const { text: transcript, source } = await getTranscript(youtubeUrl);
+    let transcript, source;
+    if (preFetchedTranscript) {
+      ({ text: transcript, source } = preFetchedTranscript);
+    } else {
+      onUpdate({ stage: "extracting_transcript", progress: 5 });
+      ({ text: transcript, source } = await getTranscript(youtubeUrl));
+    }
     onUpdate({
       stage: "extracting_transcript",
       progress: 25,

@@ -58,9 +58,12 @@ function requireApiSecret(req, res, next) {
 }
 
 app.post("/generate", requireApiSecret, (req, res) => {
-  const { youtubeUrl } = req.body ?? {};
+  const { youtubeUrl, transcript, transcriptSource } = req.body ?? {};
   if (!youtubeUrl || typeof youtubeUrl !== "string") {
     return res.status(400).json({ error: "youtubeUrl (string) is required" });
+  }
+  if (transcript !== undefined && typeof transcript !== "string") {
+    return res.status(400).json({ error: "transcript, if provided, must be a string" });
   }
   if (!process.env.GEMINI_API_KEY) {
     return res.status(500).json({ error: "GEMINI_API_KEY is not set on the server" });
@@ -69,11 +72,22 @@ app.post("/generate", requireApiSecret, (req, res) => {
   const job = createJob(youtubeUrl);
   const outputPath = path.join(JOBS_DIR, `${job.id}.pdf`);
 
+  // A client (browser/WebView, or Electron's main process via IPC) can
+  // fetch captions itself and send the text straight through, skipping
+  // the server-side attempt entirely - done specifically to dodge Render's
+  // blocked-IP problem for the mobile app (see the README's client-side
+  // transcript-fetch section). If it's absent (client didn't try, or its
+  // fetch failed), runPipeline falls through to the exact same server-side
+  // captions-then-yt-dlp flow as before - unaffected either way.
+  const preFetchedTranscript =
+    transcript && transcript.trim().length > 0 ? { text: transcript, source: transcriptSource || "client" } : null;
+
   // Fire and forget: the route responds immediately with the jobId, the
   // pipeline keeps running in the background and reports progress via
   // updateJob(), which /status/:jobId reads.
   runPipeline(youtubeUrl, outputPath, {
     onUpdate: (patch) => updateJob(job.id, patch),
+    preFetchedTranscript,
   }).catch((err) => {
     // runPipeline already records { stage: "error", error } via onUpdate
     // before rethrowing - this catch just stops the rejection from

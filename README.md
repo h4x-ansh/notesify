@@ -365,9 +365,10 @@ binary present, failing the build before it ever got to `COPY server.js`.
 Fixed with `npm ci --omit=dev --ignore-scripts`.
 
 **Environment variables** (`GEMINI_API_KEY`, `GEMINI_MODEL`,
-`OPENAI_API_KEY`, `API_SHARED_SECRET`) are set through Render's dashboard,
-not committed - `render.yaml` marks the secrets `sync: false` so Render
-prompts for them on first deploy instead of reading them from this repo.
+`OPENAI_API_KEY`, `API_SHARED_SECRET`, `YT_COOKIES_BASE64`) are set through
+Render's dashboard, not committed - `render.yaml` marks the secrets
+`sync: false` so Render prompts for them on first deploy instead of reading
+them from this repo.
 
 **Auth**: `/generate`, `/status/:jobId`, and `/download/:jobId` require an
 `X-API-Secret` header matching `API_SHARED_SECRET` once that env var is set
@@ -432,6 +433,36 @@ Findings ruled out the obvious theory:
   `OPENAI_API_KEY` presence check before yt-dlp ever ran, since that var
   isn't set there.
 
+**Fix: authenticate as a logged-in session via `YT_COOKIES_BASE64`.**
+YouTube's blocking/rate-limiting is IP-and-anonymity based; the standard
+workaround is presenting cookies from an actual logged-in browser session
+rather than an anonymous request. `YT_COOKIES_BASE64` holds a browser-
+exported Netscape-format `cookies.txt`, base64-encoded to survive as a
+single-line env var. `src/transcript.js` decodes and writes it to a temp
+file once at module load (both `server.js` and `generate-notes.js` import
+this module exactly once, so "on import" covers startup for either entry
+point) and wires it into both caption-fetch paths:
+- **yt-dlp**: `--cookies <path>` appended to its args - yt-dlp reads a
+  cookies.txt file natively.
+- **`youtube-transcript` (npm)**: no `cookies` option exists on its
+  `TranscriptConfig` type (checked - only `lang` and `fetch`), but it does
+  accept a custom `fetch`, which is enough to attach a `Cookie` header
+  built from the file's youtube.com entries the same way `--cookies` does
+  for yt-dlp.
+
+Verified without a real YouTube session (getting real cookies requires a
+logged-in browser export, not something to fabricate for testing): fed a
+fake Netscape cookie file through the actual code path (decode → write →
+parse → the real `fetchTranscript` call, with `fetch` itself swapped out to
+intercept rather than skipping any logic) and confirmed the exact `Cookie:
+CONSENT=YES+1; SID=...` header reaches the outgoing request, non-youtube.com
+cookie entries are correctly excluded, and the module loads cleanly with
+no behavior change whatsoever when `YT_COOKIES_BASE64` is unset (the
+Electron/local case) or set to something that decodes but contains no
+usable cookie lines (fails closed to today's behavior, not a crash).
+**Not yet verified**: whether real cookies actually clear the block on
+Render - that needs an actual exported session, set via the dashboard.
+
 **Known constraint: Gemini free-tier daily quota (20 requests/day).**
 Discovered mid-investigation above - two attempts got past caption fetch
 fine and then hit `429 ... GenerateRequestsPerDayPerProjectPerModel-FreeTier`
@@ -444,3 +475,155 @@ exist - a per-user "bring your own Gemini key" flow (raised, not yet
 designed) would sidestep this rather than paying for a shared quota - and
 is worth remembering before assuming a `429` here means something is
 broken.
+
+## Mobile app (Capacitor/Android)
+
+The same frontend codebase is wrapped a third way: `frontend/capacitor.config.ts`
++ `frontend/android/` package the static export as an Android APK that talks
+to the hosted Render backend (above) instead of a locally-spawned one -
+mobile can't run Puppeteer locally the way Electron does. **Separate build
+target; doesn't touch the Electron app or its local-backend config.**
+
+`frontend/lib/api.ts` serves both: `API_BASE_URL`/`API_SHARED_SECRET` are
+`NEXT_PUBLIC_*` env vars baked in at `next build` time, and which values
+apply depends entirely on which build command ran -
+[frontend/README.md](frontend/README.md#building-for-android-hosted-backend)
+has the exact commands. Verified this doesn't cross-contaminate: built both
+targets back to back and grepped each `out/` for the other's URL - the
+Electron build only ever contains `localhost:4500`, the mobile build only
+ever contains the Render URL.
+
+**Auth on mobile**: since `/download/:jobId` (and the others) require
+`X-API-Secret`, and a plain `<a href>`/`<iframe src>` can't carry a custom
+header, `fetchPdf` in `lib/api.ts` does an authenticated `fetch` + `Blob`
+instead and hands the UI an object URL. This is a real behavior change from
+the previous plain-link approach, applied to both build targets - harmless
+for Electron (no secret configured there, header is just omitted) and
+necessary for mobile.
+
+**Cold-start UX**: `IS_HOSTED_BACKEND` (true whenever `API_BASE_URL` isn't
+`localhost`) swaps the "waiting for the local server" copy for "waking up
+the server - this can take up to a minute," matching Render's actual
+spin-down behavior instead of implying something's broken.
+
+**Retry-on-`no-server`**: `fetchWithRetry` in `lib/api.ts` specifically
+retries the `404` + `x-render-routing: no-server` signature identified in
+the hosted-API investigation above, applied to `/generate`, `/status`, and
+`/download`. A real "job not found" 404 is effectively never hit in normal
+use (jobId always comes from a prior successful `/generate`), so this
+doesn't mask genuine errors.
+
+**What's actually been verified, and what hasn't:**
+- ✅ `npx cap add android` / `npx cap sync` ran cleanly and the built static
+  export (with the Render URL and secret correctly baked in - confirmed by
+  grepping the output) landed in `android/app/src/main/assets/public/`,
+  with `INTERNET` permission present in the generated `AndroidManifest.xml`.
+- ✅ The web layer was driven end-to-end against the **live** Render
+  backend: served the exact mobile build output (the same files that ship
+  inside the APK) locally and drove it with a headless browser - health
+  check with the auth header, `/generate`, status polling (including
+  transparently riding out a couple of real `no-server` 404s mid-poll),
+  reaching `done`, and an authenticated blob download that resolved to a
+  real `blob:` URL. This is the actual code path the Android WebView will
+  execute, exercised against the real backend, not a mock.
+- ❌ **Not verified**: the native Android shell itself - actually building
+  the APK in Android Studio, installing it on a device/emulator, and
+  confirming the WebView renders/behaves correctly. This development
+  environment has no Android SDK, no `adb`, no emulator, and Node 20 (this
+  project's Capacitor version was deliberately pinned to 7.x rather than
+  the Node-22-requiring 8.x for that reason - see git history if that
+  constraint changes). That step needs a machine with Android Studio.
+
+**Known limitation - baked-in shared secret**: same tradeoff as the hosted
+API's shared-secret auth, but more exposed here - `API_SHARED_SECRET` is
+compiled directly into the APK's JS bundle, extractable by unzipping the
+APK. Fine for a single-owner app; would need real per-user auth before this
+APK goes to anyone else.
+
+## Client-side transcript fetching
+
+`YT_COOKIES_BASE64` (above) was one attempt at working around YouTube
+blocking Render's IP for caption fetches. This is a more direct one:
+**don't fetch captions from Render at all** - fetch them from whichever
+device is actually running the app, which has its own, unblocked IP.
+`src/transcript.js`'s captions logic didn't move so much as get called
+from a different place depending on the build target.
+
+**The premise had a hole, found by testing it rather than assuming it'd
+work**: the plan was to run the `youtube-transcript` npm package's fetch
+calls directly in the browser/WebView. Tested that first, in real
+Chromium, before building anything on top of it - a page on a foreign
+origin calling YouTube's `youtubei/v1/player` endpoint and its watch-page
+HTML gets hard-blocked by CORS (`No 'Access-Control-Allow-Origin' header is
+present`), unconditionally, regardless of IP or rate limits. Building the
+whole feature on a `fetch()` call that was always going to be blocked by
+the browser itself - not by YouTube - would have shipped something that
+silently never worked.
+
+**What actually runs where:**
+- **Mobile (Capacitor/Android)**: `capacitor.config.ts` enables
+  `CapacitorHttp`, which patches `window.fetch` on native platforms to go
+  through native OS networking instead of the WebView's engine - not
+  subject to the WebView's CORS enforcement, since the request never
+  touches anything that enforces same-origin policy. `frontend/lib/transcript.ts`
+  calls `YoutubeTranscript.fetchTranscript()` (the same npm package,
+  installed directly in `frontend/` this time - it's pure `fetch`-based
+  with no Node built-ins, confirmed by reading its source, so it's
+  browser-safe as-is) without needing to know this patching is happening.
+- **Electron**: never actually had the blocking problem - its backend runs
+  on the user's own local IP already, not Render's - but was wired up the
+  same way for one consistent architecture. The renderer can't reach
+  Node's `fetch` directly (`contextIsolation: true`, `nodeIntegration: false`)
+  and would hit the identical CORS wall if it tried browser `fetch()`
+  directly, so `electron/preload.cjs` exposes a `window.notesifyBridge.fetchTranscript()`
+  that goes over IPC to `electron/main.js`, which calls `fetchCaptionsOnly()`
+  - a function extracted out of `src/transcript.js`'s existing captions
+  logic (no behavior change, same code, now just also reusable by the main
+  process directly) - unaffected by CORS since it's plain Node.
+- **The yt-dlp/Whisper fallback stays entirely server-side**, unchanged -
+  see `src/transcript.js`. A client never attempts it.
+
+**API contract change**: `POST /generate` now accepts optional `transcript`/
+`transcriptSource` fields (`server.js`). When present, `runPipeline()`
+(`src/pipeline.js`) skips `getTranscript()` entirely and goes straight to
+Gemini. When absent - client-side fetch wasn't attempted, or failed - the
+server falls through to the exact same captions-then-yt-dlp flow as
+before. `frontend/lib/transcript.ts`'s `fetchTranscriptClientSide()` always
+resolves to `null` rather than throwing on any failure (including a 15s
+timeout, added after noticing nothing previously bounded how long a
+stalled mobile connection could hang the UI in "Fetching transcript...");
+`NotesApp.tsx` treats `null` as an ordinary, expected outcome - not an
+error - and just omits `transcript` from the request, which is what
+triggers the old behavior. The actual failure UI (rate-limit detection,
+cooldown, "Try again") is unchanged and only engages if the request
+*still* ultimately fails after that fallback.
+
+**Verified:**
+- `fetchCaptionsOnly()` (the exact function Electron's IPC handler calls)
+  tested directly - returned a real transcript from this machine's own IP.
+- The full `NotesApp.tsx` flow driven through a real browser twice: once
+  with no `window.notesifyBridge` (simulating a plain browser/before the
+  bridge exists) - confirmed the CORS failure happens, is caught, and the
+  request sent to `/generate` correctly omits `transcript`, falling
+  through to server-side exactly as designed; once with a mocked
+  `window.notesifyBridge` (standing in for Electron's real preload
+  contract, which was verified separately) - confirmed a successful
+  client-side fetch results in `transcript`/`transcriptSource` actually
+  reaching the request body.
+- Server-side contract change verified directly: a `/generate` call
+  carrying a `transcript` field jumped straight to `generating_notes`
+  (skipping `extracting_transcript` entirely) with the exact transcript
+  text/length echoed back, and ran to `done` normally; a call without one
+  still starts at `extracting_transcript` exactly as before backward
+  compatibility confirmed, not assumed.
+- `capacitor.config.ts`'s `CapacitorHttp` setting confirmed present in the
+  generated `android/app/src/main/assets/capacitor.config.json` after a
+  fresh `cap sync`.
+
+**Not verified - same standing limitation as the rest of the mobile
+work**: no Android SDK/emulator/device in this environment, so the one
+thing that can't be confirmed here is the actual point of this whole
+change - whether a real phone, on a real network, successfully fetches a
+transcript for a video that's currently blocked on Render, via the real
+`CapacitorHttp` native bridge (not the browser `fetch()` proven blocked
+above). That needs a real device test.

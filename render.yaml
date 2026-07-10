@@ -2,10 +2,10 @@
 # only - the frontend/ and electron/ trees are excluded via .dockerignore
 # and aren't part of this service.
 #
-# Secrets (GEMINI_API_KEY, OPENAI_API_KEY, API_SHARED_SECRET) are
-# intentionally left as `sync: false` - Render will prompt for their values
-# in the dashboard on first deploy rather than reading them from this
-# committed file.
+# Secrets (GEMINI_API_KEY, OPENAI_API_KEY, API_SHARED_SECRET,
+# YT_COOKIES_BASE64) are intentionally left as `sync: false` - Render will
+# prompt for their values in the dashboard on first deploy rather than
+# reading them from this committed file.
 services:
   - type: web
     name: notesify-api
@@ -24,6 +24,12 @@ services:
       # X-API-Secret header (see requireApiSecret in server.js). Left unset
       # locally/in Electron on purpose - only Render needs this filled in.
       - key: API_SHARED_SECRET
+        sync: false
+      # Base64-encoded Netscape cookies.txt (browser-exported, logged-in
+      # YouTube session) - works around the caption-fetch/yt-dlp blocking
+      # investigated in the "Hosted API" section below. Decoded to a temp
+      # file at startup by src/transcript.js; harmless if left unset.
+      - key: YT_COOKIES_BASE64
         sync: false
       - key: JOBS_OUTPUT_DIR
         value: /app/output/jobs
