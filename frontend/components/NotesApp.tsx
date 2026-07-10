@@ -15,6 +15,7 @@ import {
   type StatusResponse,
 } from "@/lib/api";
 import { fetchTranscriptClientSide } from "@/lib/transcript";
+import { isNativeMobile, savePdfOnMobile, type SavePdfResult } from "@/lib/downloadPdf";
 
 const STAGE_LABELS: Record<Stage, string> = {
   queued: "Queued...",
@@ -53,9 +54,14 @@ export default function NotesApp() {
   const pollFailuresRef = useRef(0);
   const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);
   const [pdf, setPdf] = useState<
-    { status: "loading" } | { status: "ready"; blobUrl: string; filename: string } | { status: "error" }
+    | { status: "loading" }
+    | { status: "ready"; blob: Blob; blobUrl: string; filename: string }
+    | { status: "error" }
   >({ status: "loading" });
   const [pdfRetryTick, setPdfRetryTick] = useState(0);
+  const [mobileSave, setMobileSave] = useState<SavePdfResult | { status: "idle" } | { status: "saving" }>({
+    status: "idle",
+  });
 
   // Initial "is the local server up" probe, then keep retrying until it is.
   useEffect(() => {
@@ -142,7 +148,11 @@ export default function NotesApp() {
 
   // Fetch the PDF as an authenticated blob once a job is done - a plain
   // <a href>/<iframe src> can't carry the X-API-Secret header the hosted
-  // backend requires (see fetchPdf in lib/api.ts).
+  // backend requires (see fetchPdf in lib/api.ts). The object URL built
+  // here is only ever used for the Electron/desktop download link and the
+  // preview iframe - the mobile save/share flow (see the "done" view below)
+  // uses the raw Blob directly instead, since blob: URLs don't produce any
+  // visible behavior when tapped in Android's WebView.
   useEffect(() => {
     if (view.kind !== "done") return;
     const jobId = view.jobId;
@@ -150,14 +160,12 @@ export default function NotesApp() {
     let objectUrl: string | null = null;
 
     setPdf({ status: "loading" });
+    setMobileSave({ status: "idle" });
     fetchPdf(jobId)
-      .then(({ blobUrl, filename }) => {
-        if (cancelled) {
-          URL.revokeObjectURL(blobUrl);
-          return;
-        }
-        objectUrl = blobUrl;
-        setPdf({ status: "ready", blobUrl, filename });
+      .then(({ blob, filename }) => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setPdf({ status: "ready", blob, blobUrl: objectUrl, filename });
       })
       .catch(() => {
         if (!cancelled) setPdf({ status: "error" });
@@ -358,14 +366,35 @@ export default function NotesApp() {
 
             <div className={styles.actions}>
               {pdf.status === "ready" ? (
-                <a
-                  href={pdf.blobUrl}
-                  download={pdf.filename}
-                  className={`${styles.button} ${styles.buttonPrimary}`}
-                  style={{ textAlign: "center", textDecoration: "none", display: "block" }}
-                >
-                  Download PDF
-                </a>
+                isNativeMobile() ? (
+                  // A blob: URL (the Electron/desktop path below) produces
+                  // no visible save/open behavior when tapped inside
+                  // Android's WebView - this was the actual bug. Write +
+                  // share instead (lib/downloadPdf.ts), triggered by the
+                  // tap itself rather than automatically on load, since
+                  // that's the expected moment for a share sheet to appear.
+                  <button
+                    type="button"
+                    className={`${styles.button} ${styles.buttonPrimary}`}
+                    disabled={mobileSave.status === "saving"}
+                    onClick={async () => {
+                      setMobileSave({ status: "saving" });
+                      const result = await savePdfOnMobile(pdf.blob, pdf.filename);
+                      setMobileSave(result);
+                    }}
+                  >
+                    {mobileSave.status === "saving" ? "Saving..." : "Download PDF"}
+                  </button>
+                ) : (
+                  <a
+                    href={pdf.blobUrl}
+                    download={pdf.filename}
+                    className={`${styles.button} ${styles.buttonPrimary}`}
+                    style={{ textAlign: "center", textDecoration: "none", display: "block" }}
+                  >
+                    Download PDF
+                  </a>
+                )
               ) : (
                 <button className={`${styles.button} ${styles.buttonPrimary}`} disabled>
                   {pdf.status === "loading" ? "Preparing download..." : "Couldn't load PDF"}
@@ -381,6 +410,22 @@ export default function NotesApp() {
                 <p className={styles.errorMessage}>
                   Couldn&apos;t load the PDF -{" "}
                   <button className={styles.linkButton} style={{ display: "inline" }} onClick={() => setPdfRetryTick((n) => n + 1)}>
+                    try again
+                  </button>
+                  .
+                </p>
+              </div>
+            )}
+
+            {mobileSave.status === "shared" && <p className={styles.hint}>Shared.</p>}
+            {mobileSave.status === "saved" && (
+              <p className={styles.hint}>Saved to the app&apos;s cache - use the share sheet to move it somewhere permanent.</p>
+            )}
+            {mobileSave.status === "error" && (
+              <div className={styles.errorBox} style={{ marginTop: 16 }}>
+                <p className={styles.errorMessage}>
+                  Couldn&apos;t save the PDF - {mobileSave.message}{" "}
+                  <button className={styles.linkButton} style={{ display: "inline" }} onClick={() => setMobileSave({ status: "idle" })}>
                     try again
                   </button>
                   .

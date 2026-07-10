@@ -627,3 +627,62 @@ change - whether a real phone, on a real network, successfully fetches a
 transcript for a video that's currently blocked on Render, via the real
 `CapacitorHttp` native bridge (not the browser `fetch()` proven blocked
 above). That needs a real device test.
+
+## PDF download/save on mobile
+
+Tapping "Download PDF" on Android did nothing visible - the bug wasn't
+that the fetch failed, it's that `URL.createObjectURL()` + `<a
+href="blob:...">` (what the Electron/desktop build already used, see
+`lib/api.ts`) has no download-manager wiring in a bare WebView the way a
+real browser tab does. The tap fired, the anchor's `href` was a valid
+blob URL, and nothing happened - silence, not an error.
+
+**Fix, mobile-only**: `frontend/lib/downloadPdf.ts` writes the fetched PDF
+bytes to disk via `@capacitor/filesystem` (`Directory.Cache` - staging for
+the next step, not the final resting place; Android's scoped storage means
+an app-private cache dir isn't independently browsable by the user anyway)
+and immediately opens the system Share sheet via `@capacitor/share`, so the
+user picks where it actually goes (Downloads, a PDF viewer, another app).
+This is the standard documented Capacitor recipe for "let the user do
+something with a generated file," not a workaround invented here.
+
+**Platform branching, not a replacement**: `isNativeMobile()` (wraps
+`Capacitor.isNativePlatform()`, false in both Electron and a plain
+browser - confirmed via a real end-to-end run through the actual UI, see
+below) decides which button renders in `NotesApp.tsx`'s "done" view. The
+Electron/desktop `<a href={blobUrl}>` path is untouched code, still
+reached the exact same way.
+
+**Failure feedback, the actual complaint**: `savePdfOnMobile()` never
+throws - every outcome (shared, saved-but-not-shared because the user
+backed out of the share sheet, or a real write/share failure) resolves to
+a typed result the UI renders explicitly: "Shared.", "Saved to the app's
+cache - use the share sheet to move it somewhere permanent," or a visible
+error box with a "try again" that re-arms the button. Silence was the bug;
+every path here ends in something on screen.
+
+**Verified:**
+- Both frontend build targets compile cleanly with the new plugins,
+  including through `Capacitor.isNativePlatform()` running during Next's
+  static-export prerender (Node, no `window`) without crashing.
+- The Electron/desktop path re-verified end-to-end through the real UI
+  after this change: a real `<a href="blob:...">` with the correct
+  `download` attribute is present, and critically, `isNativeMobile()`
+  correctly returns `false` in a plain Chromium tab - no mobile Save/Share
+  button renders, confirming the platform branch doesn't leak into the
+  desktop build.
+- `npx cap sync` picked up both new plugins (`@capacitor/filesystem@7.1.8`,
+  `@capacitor/share@7.0.4`) automatically. Checked the generated Android
+  project directly rather than assuming the standard recipe would just
+  work: `AndroidManifest.xml` already has a `FileProvider` configured
+  (Capacitor's default template includes this), and its `file_paths.xml`
+  already covers `cache-path` - so `Directory.Cache` + `Share.share()`
+  needs no manual native-side configuration beyond what `cap sync` already
+  produced.
+
+**Not verified - the actual point of this fix**: whether tapping the
+button on a real device actually opens a share sheet (or shows the error
+state) instead of doing nothing. Same standing limitation as the rest of
+the mobile work - no Android SDK/emulator/device here. This needs a real
+device install: build the APK, tap Download on a completed job, and
+confirm it's the share sheet or a visible message, never silence.

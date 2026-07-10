@@ -146,11 +146,13 @@ export async function getStatus(jobId: string): Promise<StatusResponse> {
  * Downloads happen through an authenticated fetch rather than a plain
  * `<a href>`/`<iframe src>` because those can't carry the X-API-Secret
  * header the hosted backend requires - a static link would just 401.
- * Returns an object URL good for both the download link and the preview
- * iframe; callers are responsible for revoking it (URL.revokeObjectURL)
- * once it's no longer displayed.
+ * Returns the raw Blob rather than an object URL - what a caller does with
+ * it differs by platform (Electron/desktop: URL.createObjectURL() for a
+ * normal download link/preview; mobile: write it to disk and hand it to
+ * the native Share sheet, since blob: URLs don't produce any visible
+ * save/open behavior in Android's WebView - see lib/downloadPdf.ts).
  */
-export async function fetchPdf(jobId: string): Promise<{ blobUrl: string; filename: string }> {
+export async function fetchPdf(jobId: string): Promise<{ blob: Blob; filename: string }> {
   let res: Response;
   try {
     res = await fetchWithRetry(`${API_BASE_URL}/download/${jobId}`, { headers: authHeaders() });
@@ -164,7 +166,7 @@ export async function fetchPdf(jobId: string): Promise<{ blobUrl: string; filena
   const filename = match ? match[1] : "notes.pdf";
 
   const blob = await res.blob();
-  return { blobUrl: URL.createObjectURL(blob), filename };
+  return { blob, filename };
 }
 
 /** Loose client-side sanity check - the server is the real source of truth. */
