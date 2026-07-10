@@ -1,9 +1,37 @@
 .page {
   min-height: 100vh;
+  min-height: 100dvh; /* accounts for the Android nav/status bar chrome inside a Capacitor WebView */
   display: flex;
   flex-direction: column;
   align-items: center;
   padding: 64px 20px;
+}
+
+/* Phone-width viewports (built for a ~480px desktop card, this is where the
+   Capacitor/Android build actually renders) - less vertical padding so the
+   card isn't pushed unnecessarily far down a screen that's mostly height-
+   constrained, not width-constrained like desktop. */
+@media (max-width: 480px) {
+  .page {
+    padding: 32px 16px;
+  }
+
+  .card {
+    padding: 24px 20px;
+  }
+
+  /* Bumped up from the desktop 12px/14px - keeps tap targets close to the
+     ~44px minimum recommended for touch, which the desktop sizing sits
+     just under. */
+  .button {
+    padding: 14px 16px;
+    font-size: 15px;
+  }
+
+  .input {
+    padding: 14px;
+    font-size: 15px;
+  }
 }
 
 .brand {

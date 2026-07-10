@@ -5,9 +5,10 @@ import styles from "./NotesApp.module.css";
 import {
   ApiError,
   checkHealth,
-  downloadUrl,
+  fetchPdf,
   generateNotes,
   getStatus,
+  IS_HOSTED_BACKEND,
   isRateLimitError,
   looksLikeYoutubeUrl,
   type Stage,
@@ -49,6 +50,10 @@ export default function NotesApp() {
 
   const pollFailuresRef = useRef(0);
   const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);
+  const [pdf, setPdf] = useState<
+    { status: "loading" } | { status: "ready"; blobUrl: string; filename: string } | { status: "error" }
+  >({ status: "loading" });
+  const [pdfRetryTick, setPdfRetryTick] = useState(0);
 
   // Initial "is the local server up" probe, then keep retrying until it is.
   useEffect(() => {
@@ -133,6 +138,35 @@ export default function NotesApp() {
     return () => clearInterval(interval);
   }, [view.kind === "error" ? view.cooldownUntil : null]);
 
+  // Fetch the PDF as an authenticated blob once a job is done - a plain
+  // <a href>/<iframe src> can't carry the X-API-Secret header the hosted
+  // backend requires (see fetchPdf in lib/api.ts).
+  useEffect(() => {
+    if (view.kind !== "done") return;
+    const jobId = view.jobId;
+    let cancelled = false;
+    let objectUrl: string | null = null;
+
+    setPdf({ status: "loading" });
+    fetchPdf(jobId)
+      .then(({ blobUrl, filename }) => {
+        if (cancelled) {
+          URL.revokeObjectURL(blobUrl);
+          return;
+        }
+        objectUrl = blobUrl;
+        setPdf({ status: "ready", blobUrl, filename });
+      })
+      .catch(() => {
+        if (!cancelled) setPdf({ status: "error" });
+      });
+
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [view.kind === "done" ? view.jobId : null, pdfRetryTick]);
+
   function resetToInput() {
     if (cooldownRemainingMs > 0) return;
     pollFailuresRef.current = 0;
@@ -185,7 +219,7 @@ export default function NotesApp() {
           <div className={styles.unreachableWrap}>
             <span className={styles.pulseDot} />
             <p className={styles.subtitle} style={{ margin: 0 }}>
-              Connecting to local server...
+              {IS_HOSTED_BACKEND ? "Connecting..." : "Connecting to local server..."}
             </p>
           </div>
         )}
@@ -194,11 +228,12 @@ export default function NotesApp() {
           <div className={styles.unreachableWrap}>
             <span className={styles.pulseDot} />
             <p className={styles.title} style={{ margin: 0 }}>
-              Waiting for the local server
+              {IS_HOSTED_BACKEND ? "Waking up the server" : "Waiting for the local server"}
             </p>
             <p className={styles.subtitle} style={{ margin: 0 }}>
-              Can&apos;t reach the local Notesify server yet. It may still be starting up - this will reconnect
-              automatically.
+              {IS_HOSTED_BACKEND
+                ? "The hosted server spins down after a period of inactivity - the first request can take up to a minute to wake it back up. This will reconnect automatically."
+                : "Can't reach the local Notesify server yet. It may still be starting up - this will reconnect automatically."}
             </p>
           </div>
         )}
@@ -241,7 +276,9 @@ export default function NotesApp() {
           <div>
             <p className={styles.title}>Generating your notes</p>
             {view.reconnecting && (
-              <div className={styles.reconnectBanner}>Lost connection to the local server - retrying...</div>
+              <div className={styles.reconnectBanner}>
+                Lost connection to the {IS_HOSTED_BACKEND ? "" : "local "}server - retrying...
+              </div>
             )}
             <p className={styles.stageLabel}>{STAGE_LABELS[view.status.stage]}</p>
             <div className={styles.progressTrack}>
@@ -300,22 +337,43 @@ export default function NotesApp() {
             )}
 
             <div className={styles.actions}>
-              <a
-                href={downloadUrl(view.jobId)}
-                className={`${styles.button} ${styles.buttonPrimary}`}
-                style={{ textAlign: "center", textDecoration: "none", display: "block" }}
-              >
-                Download PDF
-              </a>
+              {pdf.status === "ready" ? (
+                <a
+                  href={pdf.blobUrl}
+                  download={pdf.filename}
+                  className={`${styles.button} ${styles.buttonPrimary}`}
+                  style={{ textAlign: "center", textDecoration: "none", display: "block" }}
+                >
+                  Download PDF
+                </a>
+              ) : (
+                <button className={`${styles.button} ${styles.buttonPrimary}`} disabled>
+                  {pdf.status === "loading" ? "Preparing download..." : "Couldn't load PDF"}
+                </button>
+              )}
               <button className={styles.linkButton} onClick={resetToInput}>
                 Generate another
               </button>
             </div>
 
-            <div className={styles.previewWrap}>
-              <iframe className={styles.previewFrame} src={downloadUrl(view.jobId)} title="Notes preview" />
-              <p className={styles.previewFallback}>Preview may not render in every browser - download if it looks blank.</p>
-            </div>
+            {pdf.status === "error" && (
+              <div className={styles.errorBox} style={{ marginTop: 16 }}>
+                <p className={styles.errorMessage}>
+                  Couldn&apos;t load the PDF -{" "}
+                  <button className={styles.linkButton} style={{ display: "inline" }} onClick={() => setPdfRetryTick((n) => n + 1)}>
+                    try again
+                  </button>
+                  .
+                </p>
+              </div>
+            )}
+
+            {pdf.status === "ready" && (
+              <div className={styles.previewWrap}>
+                <iframe className={styles.previewFrame} src={pdf.blobUrl} title="Notes preview" />
+                <p className={styles.previewFallback}>Preview may not render in every browser - download if it looks blank.</p>
+              </div>
+            )}
           </div>
         )}
       </div>

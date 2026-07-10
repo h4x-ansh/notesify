@@ -1,4 +1,12 @@
 node_modules/
 .next/
 .env.local
+.env.mobile
 out/
+
+# Capacitor's official guidance is to commit the native platform project
+# (android/) rather than gitignore it - `cap sync` only updates web assets
+# and plugin registrations, not native-side customization (icons,
+# permissions, signing config) that Android Studio will end up writing into
+# it once this app is developed further. Unlike dist/ (Electron), this
+# isn't purely regenerable from config alone.
