@@ -14,6 +14,7 @@ import {
   type Stage,
   type StatusResponse,
 } from "@/lib/api";
+import { fetchTranscriptClientSide } from "@/lib/transcript";
 
 const STAGE_LABELS: Record<Stage, string> = {
   queued: "Queued...",
@@ -47,6 +48,7 @@ export default function NotesApp() {
   const [urlError, setUrlError] = useState<string | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [submitPhase, setSubmitPhase] = useState<"transcript" | "starting" | null>(null);
 
   const pollFailuresRef = useRef(0);
   const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);
@@ -184,7 +186,20 @@ export default function NotesApp() {
     setSubmitError(null);
     setSubmitting(true);
     try {
-      const { jobId } = await generateNotes(url.trim());
+      // Try fetching captions ourselves first - on the client's own IP
+      // (Electron: the user's machine via main-process IPC; mobile: the
+      // device's own network via CapacitorHttp) rather than the hosted
+      // backend's, which is what YouTube has been blocking (see the
+      // caption-fetch investigation and client-side transcript-fetch
+      // sections in the root README). A failure here isn't an error state -
+      // it's expected and handled by simply not sending a transcript, which
+      // makes the server fall back to its own captions-then-yt-dlp attempt
+      // exactly as before.
+      setSubmitPhase("transcript");
+      const clientTranscript = await fetchTranscriptClientSide(url.trim());
+
+      setSubmitPhase("starting");
+      const { jobId } = await generateNotes(url.trim(), clientTranscript);
       pollFailuresRef.current = 0;
       setView({ kind: "progress", jobId, status: { stage: "queued", progress: 0, error: null }, reconnecting: false });
     } catch (err) {
@@ -203,6 +218,7 @@ export default function NotesApp() {
       }
     } finally {
       setSubmitting(false);
+      setSubmitPhase(null);
     }
   }
 
@@ -264,7 +280,11 @@ export default function NotesApp() {
             </div>
 
             <button type="submit" className={`${styles.button} ${styles.buttonPrimary}`} disabled={submitting || !url.trim()}>
-              {submitting ? "Generating..." : "Generate Notes"}
+              {submitPhase === "transcript"
+                ? "Fetching transcript..."
+                : submitting
+                  ? "Generating..."
+                  : "Generate Notes"}
             </button>
             {submitError && <p className={styles.fieldError}>{submitError}</p>}
 

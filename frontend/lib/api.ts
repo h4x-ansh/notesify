@@ -101,13 +101,28 @@ export async function checkHealth(timeoutMs = 3000): Promise<boolean> {
   }
 }
 
-export async function generateNotes(youtubeUrl: string): Promise<{ jobId: string }> {
+/**
+ * `clientTranscript`, when present, was already fetched client-side (see
+ * lib/transcript.ts) - the server skips its own captions/yt-dlp attempt
+ * entirely and goes straight to notes generation. Omit it (or pass null,
+ * e.g. the client-side fetch failed) to get the old behavior: the server
+ * tries on its own, still falling back to yt-dlp/Whisper as before.
+ */
+export async function generateNotes(
+  youtubeUrl: string,
+  clientTranscript?: { text: string; source: string } | null
+): Promise<{ jobId: string }> {
   let res: Response;
   try {
     res = await fetchWithRetry(`${API_BASE_URL}/generate`, {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ youtubeUrl }),
+      body: JSON.stringify({
+        youtubeUrl,
+        ...(clientTranscript
+          ? { transcript: clientTranscript.text, transcriptSource: clientTranscript.source }
+          : {}),
+      }),
     });
   } catch {
     throw new ApiError("Can't reach the server. Is it running?");
