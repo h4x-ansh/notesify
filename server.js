@@ -4,9 +4,12 @@ import express from "express";
 import rateLimit from "express-rate-limit";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 import { runPipeline } from "./src/pipeline.js";
 import { createJob, updateJob, getJob, listJobs } from "./src/jobStore.js";
 import { STYLE_PRESETS } from "./src/template.js";
+import { resolvePlaylistVideoUrls, chunkPlaylistVideos, PLAYLIST_CHUNK_SIZE, MAX_PLAYLIST_CHUNKS } from "./src/playlist.js";
+import { classifyError } from "./src/errors.js";
 
 /**
  * API wrapping the same pipeline the CLI uses. Runs two ways: spawned
@@ -110,6 +113,19 @@ const statusLimiter = makeLimiter({
   message: "Too many status requests from this IP. Please slow down.",
 });
 
+// Resolving a playlist (yt-dlp --flat-playlist, no Gemini cost) now happens
+// once *before* every playlist submission (see the frontend's client-side
+// transcript prefetch work - it needs the real video URLs to fetch
+// transcripts for, which requires resolving first) rather than only when a
+// caller actually generates - a much more generous cap than generateLimiter
+// is warranted since this fires on every playlist paste/retry, not just an
+// actual submission.
+const playlistResolveLimiter = makeLimiter({
+  windowMs: Number(process.env.RATE_LIMIT_PLAYLIST_RESOLVE_WINDOW_MS) || 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_PLAYLIST_RESOLVE_MAX) || 20,
+  message: "Too many playlist lookups from this IP. Please slow down.",
+});
+
 const downloadLimiter = makeLimiter({
   windowMs: Number(process.env.RATE_LIMIT_DOWNLOAD_WINDOW_MS) || 15 * 60 * 1000,
   max: Number(process.env.RATE_LIMIT_DOWNLOAD_MAX) || 20,
@@ -184,8 +200,98 @@ const MAX_BATCH_VIDEOS = 25;
 const ALLOWED_LANGUAGES = ["English", "Hindi", "Tamil", "Bengali"];
 const ALLOWED_STYLE_IDS = Object.keys(STYLE_PRESETS);
 
-app.post("/generate", requireApiSecret, generateLimiter, (req, res) => {
-  const { youtubeUrl, transcript, transcriptSource, requestId, videoUrls, playlistUrl, language, styleId } = req.body ?? {};
+// Per-video pre-fetched transcripts for the batch/playlist paths (see the
+// frontend's client-side transcript prefetch work) - the same IP-blocking
+// problem `transcript`/`transcriptSource` solve for a single video applies
+// per-video here too, since every batch/playlist video was still being
+// fetched server-side (Render's own IP) even after the single-video path
+// switched to client-side fetching. Keyed by the exact video URL string the
+// client fetched against; entries missing from this map fall through to the
+// existing server-side captions-then-yt-dlp/Whisper flow per video,
+// unchanged - see pipeline.js's fetchAndMergeTranscripts.
+const MAX_TRANSCRIPTS_ENTRIES = PLAYLIST_CHUNK_SIZE * MAX_PLAYLIST_CHUNKS;
+
+function validateTranscriptsMap(transcripts) {
+  if (transcripts === undefined) return null;
+  if (typeof transcripts !== "object" || transcripts === null || Array.isArray(transcripts)) {
+    return "transcripts, if provided, must be an object mapping video URLs to {text, source}";
+  }
+  const entries = Object.entries(transcripts);
+  if (entries.length > MAX_TRANSCRIPTS_ENTRIES) {
+    return `transcripts must not contain more than ${MAX_TRANSCRIPTS_ENTRIES} entries`;
+  }
+  for (const [url, value] of entries) {
+    if (url.length > MAX_YOUTUBE_URL_LENGTH || !YOUTUBE_URL_PATTERN.test(url)) {
+      return `transcripts contains an invalid video URL key: ${url}`;
+    }
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      typeof value.text !== "string" ||
+      value.text.length === 0 ||
+      value.text.length > MAX_TRANSCRIPT_LENGTH
+    ) {
+      return `transcripts["${url}"] must be {text: non-empty string under ${MAX_TRANSCRIPT_LENGTH} chars, source}`;
+    }
+    if (value.source !== undefined && !ALLOWED_TRANSCRIPT_SOURCES.includes(value.source)) {
+      return `transcripts["${url}"].source, if provided, must be one of: ${ALLOWED_TRANSCRIPT_SOURCES.join(", ")}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Resolves a playlist to its real per-video URLs (chunked the same way
+ * /generate would) *without* creating any job - used by the frontend before
+ * every playlist submission now, not just chunked ones, so it can fetch
+ * each video's transcript client-side (see the frontend's prefetch work)
+ * before ever calling /generate. /generate's own playlistUrl handling below
+ * still does its own resolve+chunk independently (unchanged, kept for
+ * backward compatibility with any caller that doesn't front-run with this
+ * endpoint) - the two happen to resolve the same playlist twice for the UI's
+ * normal path, an accepted tradeoff for keeping /generate's existing,
+ * already-verified chunking logic untouched.
+ */
+app.post("/playlist/resolve", requireApiSecret, playlistResolveLimiter, async (req, res) => {
+  const { playlistUrl } = req.body ?? {};
+  if (
+    typeof playlistUrl !== "string" ||
+    playlistUrl.length > MAX_YOUTUBE_URL_LENGTH ||
+    !YOUTUBE_HOST_PATTERN.test(playlistUrl) ||
+    !LIST_PARAM_PATTERN.test(playlistUrl)
+  ) {
+    return res.status(400).json({ error: "playlistUrl must be a valid YouTube URL containing a ?list= parameter" });
+  }
+
+  try {
+    const urls = await resolvePlaylistVideoUrls(playlistUrl);
+    const plan = chunkPlaylistVideos(urls);
+    res.json({
+      totalVideos: plan.totalVideos,
+      chunkSize: plan.chunkSize,
+      chunkCount: plan.chunkCount,
+      chunks: plan.chunks.map((c) => ({ index: c.index, start: c.start, end: c.end, urls: c.urls })),
+    });
+  } catch (err) {
+    console.error("[playlist/resolve] failed:", err.message);
+    const { code, message } = classifyError(err);
+    res.status(400).json({ error: message, errorCode: code });
+  }
+});
+
+app.post("/generate", requireApiSecret, generateLimiter, async (req, res) => {
+  const {
+    youtubeUrl,
+    transcript,
+    transcriptSource,
+    requestId,
+    videoUrls,
+    playlistUrl,
+    language,
+    styleId,
+    confirmChunking,
+    transcripts,
+  } = req.body ?? {};
 
   const modesProvided = [youtubeUrl, videoUrls, playlistUrl].filter((v) => v !== undefined).length;
   if (modesProvided !== 1) {
@@ -242,6 +348,13 @@ app.post("/generate", requireApiSecret, generateLimiter, (req, res) => {
   if (styleId !== undefined && !ALLOWED_STYLE_IDS.includes(styleId)) {
     return res.status(400).json({ error: `styleId, if provided, must be one of: ${ALLOWED_STYLE_IDS.join(", ")}` });
   }
+  if (confirmChunking !== undefined && typeof confirmChunking !== "boolean") {
+    return res.status(400).json({ error: "confirmChunking, if provided, must be a boolean" });
+  }
+  const transcriptsError = validateTranscriptsMap(transcripts);
+  if (transcriptsError) {
+    return res.status(400).json({ error: transcriptsError });
+  }
   if (!process.env.GEMINI_API_KEY) {
     return res.status(500).json({ error: "GEMINI_API_KEY is not set on the server" });
   }
@@ -250,6 +363,9 @@ app.post("/generate", requireApiSecret, generateLimiter, (req, res) => {
     pruneIdempotencyCache();
     const existing = recentGenerateRequests.get(requestId);
     if (existing) {
+      if (existing.batchGroupId) {
+        return res.status(202).json({ batchGroupId: existing.batchGroupId, jobIds: existing.jobIds });
+      }
       return res.status(202).json({ jobId: existing.jobId });
     }
   }
@@ -259,6 +375,66 @@ app.post("/generate", requireApiSecret, generateLimiter, (req, res) => {
   // (src/pipeline.js), same as the single-video path below just with a
   // different transcript-acquisition step. youtubeUrl is null here since
   // it's unused in that branch.
+  // Playlists get resolved and planned into chunks *before* any job is
+  // created - a playlist over one chunk's worth of videos (PLAYLIST_CHUNK_SIZE)
+  // needs the caller to explicitly confirm (confirmChunking: true) before
+  // this fires off multiple independent Gemini calls, one per chunk. A
+  // playlist that fits in a single chunk falls straight through to
+  // runPipeline's existing playlistUrl branch below, unchanged from before
+  // auto-chunking existed.
+  if (playlistUrl !== undefined) {
+    let plan;
+    try {
+      const urls = await resolvePlaylistVideoUrls(playlistUrl);
+      plan = chunkPlaylistVideos(urls);
+    } catch (err) {
+      console.error("[generate] playlist resolution/planning failed:", err.message);
+      const { code, message } = classifyError(err);
+      return res.status(400).json({ error: message, errorCode: code });
+    }
+
+    if (plan.chunkCount > 1) {
+      if (!confirmChunking) {
+        return res.status(409).json({
+          needsConfirmation: true,
+          totalVideos: plan.totalVideos,
+          chunkSize: plan.chunkSize,
+          chunkCount: plan.chunkCount,
+          chunks: plan.chunks.map((c) => ({ index: c.index, start: c.start, end: c.end, count: c.urls.length })),
+        });
+      }
+
+      console.log(`[generate] confirmed playlist chunking: ${plan.totalVideos} videos -> ${plan.chunkCount} chunks`);
+      const batchGroupId = randomUUID();
+      const jobIds = [];
+      for (const chunk of plan.chunks) {
+        const descriptor = `[playlist chunk ${chunk.index + 1}/${plan.chunkCount}] ${playlistUrl}`;
+        const job = createJob(descriptor);
+        updateJob(job.id, {
+          meta: { batchGroupId, chunkIndex: chunk.index, chunkCount: plan.chunkCount, chunkRange: `${chunk.start}-${chunk.end}` },
+        });
+        jobIds.push(job.id);
+        const outputPath = path.join(JOBS_DIR, `${job.id}.pdf`);
+
+        runPipeline(null, outputPath, {
+          onUpdate: (patch) => updateJob(job.id, patch),
+          videoUrls: chunk.urls,
+          language,
+          styleId,
+          preFetchedTranscripts: transcripts,
+        }).catch((err) => {
+          console.error(`[job ${job.id}] failed:`, err.message);
+        });
+      }
+
+      if (requestId) recentGenerateRequests.set(requestId, { batchGroupId, jobIds, createdAt: Date.now() });
+      return res.status(202).json({ batchGroupId, jobIds });
+    }
+    // Falls through to the single-job path below with plan.chunkCount === 1
+    // (the whole playlist fits in one chunk) - behaves exactly as it did
+    // before auto-chunking existed.
+  }
+
   if (videoUrls !== undefined || playlistUrl !== undefined) {
     console.log("[generate] batch request received:", playlistUrl ? { playlistUrl } : { videoUrls });
     const descriptor = playlistUrl ? `[playlist] ${playlistUrl}` : `[batch of ${videoUrls.length}] ${videoUrls.join(", ")}`;
@@ -272,6 +448,7 @@ app.post("/generate", requireApiSecret, generateLimiter, (req, res) => {
       playlistUrl,
       language,
       styleId,
+      preFetchedTranscripts: transcripts,
     }).catch((err) => {
       console.error(`[job ${job.id}] failed:`, err.message);
     });

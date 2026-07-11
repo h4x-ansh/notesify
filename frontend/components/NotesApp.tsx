@@ -12,8 +12,12 @@ import {
   IS_HOSTED_BACKEND,
   isRateLimitError,
   looksLikeYoutubeUrl,
+  resolvePlaylist,
   type BatchPayload,
+  type GenerateBatchResult,
   type Language,
+  type PlaylistPlan,
+  type PlaylistResolution,
   type Stage,
   type StatusResponse,
 } from "@/lib/api";
@@ -34,6 +38,11 @@ const STAGE_LABELS: Record<Stage, string> = {
 const POLL_INTERVAL_MS = 2000;
 const HEALTH_RETRY_MS = 2000;
 const MAX_CONSECUTIVE_POLL_FAILURES = 5;
+// A chunked-playlist submission polls up to MAX_PLAYLIST_CHUNKS (3) jobs at
+// once - a longer interval than the single-job POLL_INTERVAL_MS keeps that
+// comfortably under the server's per-IP /status rate limit (60/min default)
+// even with all chunks in flight simultaneously.
+const BATCH_POLL_INTERVAL_MS = 4000;
 
 // What the picker screen (LanguageStylePicker) generates from, deferred
 // until its own "Generate" click - see handleGenerate. "single" carries
@@ -44,6 +53,15 @@ const MAX_CONSECUTIVE_POLL_FAILURES = 5;
 // juggling its result across a screen transition for no real benefit.
 type PendingSource = { type: "single"; url: string } | { type: "batch"; payload: BatchPayload };
 
+// One chunk of an auto-split playlist (see server.js's chunkPlaylistVideos)
+// - its own job, own status, own PDF once done. `pdf` mirrors the shape the
+// single-video "done" view already uses for its own blob-loading states.
+type ChunkJob = {
+  jobId: string;
+  status: StatusResponse;
+  pdf: { status: "pending" | "loading" | "error" } | { status: "ready"; blobUrl: string; filename: string };
+};
+
 type View =
   | { kind: "checking-server" }
   | { kind: "server-unreachable" }
@@ -51,7 +69,20 @@ type View =
   | { kind: "input" }
   | { kind: "multi-link" }
   | { kind: "picker"; source: PendingSource }
+  | {
+      kind: "confirm-chunks";
+      payload: BatchPayload;
+      language: Language;
+      styleId: string;
+      plan: PlaylistPlan;
+      // Raw per-chunk video URLs from the /playlist/resolve call that
+      // produced `plan` - kept around so confirming doesn't need to
+      // re-resolve the playlist just to know which videos to prefetch
+      // transcripts for (see handleConfirmChunking).
+      resolution: PlaylistResolution;
+    }
   | { kind: "progress"; jobId: string; status: StatusResponse; reconnecting: boolean }
+  | { kind: "batch-progress"; batchGroupId: string; jobs: ChunkJob[] }
   | { kind: "done"; jobId: string; status: StatusResponse }
   | { kind: "error"; message: string; rateLimited: boolean; cooldownUntil: number | null };
 
@@ -60,12 +91,46 @@ function rateLimitCooldownMs(): number {
   return (45 + Math.floor(Math.random() * 16)) * 1000; // 45-60s
 }
 
+/**
+ * Fetches transcripts client-side for every URL in a batch/playlist chunk,
+ * one at a time, before the request ever reaches /generate - the batch
+ * equivalent of what the single-video path already does via
+ * fetchTranscriptClientSide (see handleGenerate). Sequential rather than
+ * parallel so `onProgress` can report a clean "N of M" count instead of a
+ * pile of simultaneous in-flight requests with no clear single number to
+ * show, and so this doesn't hammer YouTube with a burst of concurrent
+ * requests from one client.
+ *
+ * A URL missing from the returned map means client-side fetch failed or
+ * wasn't available (e.g. running in a plain browser, or that specific video
+ * has no captions) - same partial-success policy as the existing server-
+ * side batch handling: skip it here, note nothing (the server's own
+ * fallback attempt is what actually records a skip reason if it fails too),
+ * and continue with the rest.
+ */
+async function prefetchTranscripts(
+  urls: string[],
+  onProgress: (label: string) => void
+): Promise<Record<string, { text: string; source: string }>> {
+  const transcripts: Record<string, { text: string; source: string }> = {};
+  for (let i = 0; i < urls.length; i++) {
+    onProgress(`Fetching transcripts on-device (${i + 1} of ${urls.length})...`);
+    const result = await fetchTranscriptClientSide(urls[i]);
+    if (result) transcripts[urls[i]] = result;
+  }
+  return transcripts;
+}
+
 export default function NotesApp() {
   const [view, setView] = useState<View>({ kind: "checking-server" });
   const [url, setUrl] = useState("");
   const [urlError, setUrlError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const [submitPhase, setSubmitPhase] = useState<"transcript" | "starting" | null>(null);
+  // What the picker/confirm-chunks screen's submit button shows while
+  // `submitting` - a plain string rather than a phase enum since the batch
+  // prefetch loop needs to show a live-updating "N of M" count
+  // (prefetchTranscripts above), not just a fixed set of phases.
+  const [submitStatusLabel, setSubmitStatusLabel] = useState("Generating...");
 
   const pollFailuresRef = useRef(0);
   const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);
@@ -147,6 +212,109 @@ export default function NotesApp() {
     };
   }, [view.kind === "progress" ? view.jobId : null]);
 
+  // Latest `view` for the batch-progress polling effect below to read at
+  // tick time - a plain closure over `view` would poll against whatever
+  // jobs existed when the effect was set up, not the latest statuses/pdf
+  // states, since the effect's own dependency array intentionally only
+  // re-runs on batchGroupId change (not on every jobs update, which would
+  // tear down and restart the interval on every single poll tick).
+  const viewRef = useRef(view);
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
+
+  const batchBlobUrlsRef = useRef<string[]>([]);
+
+  async function fetchChunkPdf(batchGroupId: string, jobId: string) {
+    setView((prev) =>
+      prev.kind === "batch-progress" && prev.batchGroupId === batchGroupId
+        ? { ...prev, jobs: prev.jobs.map((j) => (j.jobId === jobId ? { ...j, pdf: { status: "loading" } } : j)) }
+        : prev
+    );
+    try {
+      const { blob, filename } = await fetchPdf(jobId);
+      const blobUrl = URL.createObjectURL(blob);
+      batchBlobUrlsRef.current.push(blobUrl);
+      setView((prev) =>
+        prev.kind === "batch-progress" && prev.batchGroupId === batchGroupId
+          ? { ...prev, jobs: prev.jobs.map((j) => (j.jobId === jobId ? { ...j, pdf: { status: "ready", blobUrl, filename } } : j)) }
+          : prev
+      );
+    } catch {
+      setView((prev) =>
+        prev.kind === "batch-progress" && prev.batchGroupId === batchGroupId
+          ? { ...prev, jobs: prev.jobs.map((j) => (j.jobId === jobId ? { ...j, pdf: { status: "error" } } : j)) }
+          : prev
+      );
+    }
+  }
+
+  // Polls every still-in-flight chunk job each tick (rather than every job
+  // unconditionally) so the request volume drops off as chunks finish
+  // instead of staying constant for the whole batch - matters here because
+  // up to MAX_PLAYLIST_CHUNKS jobs are polled concurrently, unlike the
+  // single-job effect above. Fetches each chunk's PDF as soon as it's done,
+  // same as the single-video "done" view already does, just per-chunk.
+  useEffect(() => {
+    if (view.kind !== "batch-progress") return;
+    const batchGroupId = view.batchGroupId;
+    let cancelled = false;
+
+    async function tick() {
+      const current = viewRef.current;
+      if (current.kind !== "batch-progress" || current.batchGroupId !== batchGroupId) return;
+      const pending = current.jobs.filter((j) => j.status.stage !== "done" && j.status.stage !== "error");
+      if (pending.length === 0) return;
+
+      const updates = await Promise.all(
+        pending.map(async (j) => {
+          try {
+            return { jobId: j.jobId, status: await getStatus(j.jobId) };
+          } catch {
+            return { jobId: j.jobId, status: null as StatusResponse | null };
+          }
+        })
+      );
+      if (cancelled) return;
+
+      setView((prev) => {
+        if (prev.kind !== "batch-progress" || prev.batchGroupId !== batchGroupId) return prev;
+        return {
+          ...prev,
+          jobs: prev.jobs.map((j) => {
+            const update = updates.find((u) => u.jobId === j.jobId);
+            return update?.status ? { ...j, status: update.status } : j;
+          }),
+        };
+      });
+
+      for (const u of updates) {
+        if (u.status?.stage === "done") {
+          const job = current.jobs.find((j) => j.jobId === u.jobId);
+          if (job && job.pdf.status === "pending") fetchChunkPdf(batchGroupId, u.jobId);
+        }
+      }
+    }
+
+    tick();
+    const interval = setInterval(tick, BATCH_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [view.kind === "batch-progress" ? view.batchGroupId : null]);
+
+  // Revokes every blob URL created for this batch once its view is left
+  // (mirrors the single-job "done" view's per-job cleanup, just for however
+  // many chunk PDFs got fetched before navigating away).
+  useEffect(() => {
+    if (view.kind !== "batch-progress") return;
+    return () => {
+      batchBlobUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
+      batchBlobUrlsRef.current = [];
+    };
+  }, [view.kind === "batch-progress" ? view.batchGroupId : null]);
+
   // Tick down the rate-limit cooldown once a second while an error view is
   // showing one, so the "Try again" button re-enables on its own without
   // requiring another click/poll.
@@ -223,42 +391,139 @@ export default function NotesApp() {
     setView({ kind: "picker", source: { type: "batch", payload } });
   }
 
+  function handleGenerateError(err: unknown) {
+    if (err instanceof ApiError && !err.status) {
+      setView({ kind: "server-unreachable" });
+    } else {
+      const message = err instanceof Error ? err.message : "Failed to start generation.";
+      const rateLimited = isRateLimitError(message);
+      setView({
+        kind: "error",
+        message,
+        rateLimited,
+        cooldownUntil: rateLimited ? Date.now() + rateLimitCooldownMs() : null,
+      });
+    }
+  }
+
+  // Turns a /generate response into the next view. `needsConfirmation`
+  // shouldn't actually happen via this path anymore - handleGenerate now
+  // always resolves a playlist (resolvePlaylist) and decides chunking
+  // client-side *before* ever calling generateNotesBatch, specifically so
+  // it has the real per-video URLs to prefetch transcripts for (see
+  // handleGenerate/handleConfirmChunking below). /generate's own 409 still
+  // exists server-side as a safety net for any caller that skips that
+  // pre-resolution step, but this UI is never that caller - if it somehow
+  // shows up anyway (e.g. the playlist changed between resolve and submit),
+  // there's no `resolution` on hand to build the confirm-chunks view from
+  // without another round trip, so this surfaces as a plain error asking
+  // the user to retry rather than silently reconstructing a fake one.
+  function applyGenerateResult(result: GenerateBatchResult) {
+    if (result.kind === "needsConfirmation") {
+      setView({
+        kind: "error",
+        message: "This playlist changed while starting generation - please try again.",
+        rateLimited: false,
+        cooldownUntil: null,
+      });
+      return;
+    }
+    pollFailuresRef.current = 0;
+    if (result.kind === "batch") {
+      setView({
+        kind: "batch-progress",
+        batchGroupId: result.batchGroupId,
+        jobs: result.jobIds.map((jobId) => ({
+          jobId,
+          status: { stage: "queued", progress: 0, error: null },
+          pdf: { status: "pending" },
+        })),
+      });
+      return;
+    }
+    setView({ kind: "progress", jobId: result.jobId, status: { stage: "queued", progress: 0, error: null }, reconnecting: false });
+  }
+
   // The actual submission, for both paths - fired from the picker screen's
-  // "Generate" button, language/styleId chosen there. Single-video's
-  // client-side transcript pre-fetch (unchanged logic, just moved here from
-  // the old handleSubmit) still isn't attempted for a batch source - that's
-  // tied to one known video URL, and a batch/playlist's transcripts are
-  // fetched server-side per video either way (see src/pipeline.js).
+  // "Generate" button, language/styleId chosen there. Every path now
+  // attempts a client-side transcript fetch first (single video via
+  // fetchTranscriptClientSide, batch/playlist via prefetchTranscripts over
+  // each video) before ever calling /generate - the same Render-IP-blocking
+  // workaround the single-video path has always used, closed for the
+  // batch/playlist paths too. A playlist has to be resolved to its real
+  // per-video URLs first (resolvePlaylist) since the client doesn't know
+  // them just from the playlistUrl string - that resolution also decides
+  // whether the confirm-chunks screen is needed, same trigger (more than
+  // one chunk) as before, just decided client-side now instead of via
+  // /generate's 409.
   async function handleGenerate(source: PendingSource, language: Language, styleId: string) {
     setSubmitting(true);
     try {
-      let jobId: string;
       if (source.type === "single") {
-        setSubmitPhase("transcript");
+        setSubmitStatusLabel("Fetching transcript...");
         const clientTranscript = await fetchTranscriptClientSide(source.url);
-        setSubmitPhase("starting");
-        ({ jobId } = await generateNotes(source.url, clientTranscript, { language, styleId }));
+        setSubmitStatusLabel("Starting...");
+        const { jobId } = await generateNotes(source.url, clientTranscript, { language, styleId });
+        pollFailuresRef.current = 0;
+        setView({ kind: "progress", jobId, status: { stage: "queued", progress: 0, error: null }, reconnecting: false });
+      } else if ("videoUrls" in source.payload) {
+        const transcripts = await prefetchTranscripts(source.payload.videoUrls, setSubmitStatusLabel);
+        setSubmitStatusLabel("Starting...");
+        const result = await generateNotesBatch(source.payload, { language, styleId, transcripts });
+        applyGenerateResult(result);
       } else {
-        ({ jobId } = await generateNotesBatch(source.payload, { language, styleId }));
+        setSubmitStatusLabel("Looking up playlist...");
+        const resolution = await resolvePlaylist(source.payload.playlistUrl);
+        if (resolution.chunkCount > 1) {
+          setView({
+            kind: "confirm-chunks",
+            payload: source.payload,
+            language,
+            styleId,
+            plan: {
+              totalVideos: resolution.totalVideos,
+              chunkSize: resolution.chunkSize,
+              chunkCount: resolution.chunkCount,
+              chunks: resolution.chunks.map((c) => ({ index: c.index, start: c.start, end: c.end, count: c.urls.length })),
+            },
+            resolution,
+          });
+        } else {
+          const urls = resolution.chunks[0]?.urls ?? [];
+          const transcripts = await prefetchTranscripts(urls, setSubmitStatusLabel);
+          setSubmitStatusLabel("Starting...");
+          const result = await generateNotesBatch(source.payload, { language, styleId, transcripts });
+          applyGenerateResult(result);
+        }
       }
-      pollFailuresRef.current = 0;
-      setView({ kind: "progress", jobId, status: { stage: "queued", progress: 0, error: null }, reconnecting: false });
     } catch (err) {
-      if (err instanceof ApiError && !err.status) {
-        setView({ kind: "server-unreachable" });
-      } else {
-        const message = err instanceof Error ? err.message : "Failed to start generation.";
-        const rateLimited = isRateLimitError(message);
-        setView({
-          kind: "error",
-          message,
-          rateLimited,
-          cooldownUntil: rateLimited ? Date.now() + rateLimitCooldownMs() : null,
-        });
-      }
+      handleGenerateError(err);
     } finally {
       setSubmitting(false);
-      setSubmitPhase(null);
+      setSubmitStatusLabel("Generating...");
+    }
+  }
+
+  // Fired from the confirm-chunks view's own "Confirm & generate" button -
+  // the only place confirmChunking:true is ever sent, only reachable after
+  // the user has seen the exact PlaylistPlan (chunk count/ranges) this
+  // submits against. `resolution` is the same one handleGenerate already
+  // fetched to build that plan - reused here rather than re-resolving, so
+  // confirming doesn't cost another yt-dlp round trip just to find out which
+  // videos to prefetch transcripts for.
+  async function handleConfirmChunking(payload: BatchPayload, language: Language, styleId: string, resolution: PlaylistResolution) {
+    setSubmitting(true);
+    try {
+      const allUrls = resolution.chunks.flatMap((c) => c.urls);
+      const transcripts = await prefetchTranscripts(allUrls, setSubmitStatusLabel);
+      setSubmitStatusLabel("Starting...");
+      const result = await generateNotesBatch(payload, { language, styleId, confirmChunking: true, transcripts });
+      applyGenerateResult(result);
+    } catch (err) {
+      handleGenerateError(err);
+    } finally {
+      setSubmitting(false);
+      setSubmitStatusLabel("Generating...");
     }
   }
 
@@ -363,8 +628,43 @@ export default function NotesApp() {
             onBack={() => setView(view.source.type === "single" ? { kind: "input" } : { kind: "multi-link" })}
             onGenerate={(language, styleId) => handleGenerate(view.source, language, styleId)}
             submitting={submitting}
-            submitLabel={submitPhase === "transcript" ? "Fetching transcript..." : "Generating..."}
+            submitLabel={submitStatusLabel}
           />
+        )}
+
+        {view.kind === "confirm-chunks" && (
+          <div>
+            <p className={styles.title}>Confirm batch generation</p>
+            <p className={styles.subtitle}>
+              This playlist has {view.plan.totalVideos} videos - this will generate {view.plan.chunkCount} separate note
+              PDFs and will use {view.plan.chunkCount} of your daily generations.
+            </p>
+            <div className={styles.metaLog}>
+              {view.plan.chunks.map((c) => (
+                <p className={styles.metaLine} key={c.index}>
+                  PDF {c.index + 1}: videos {c.start}-{c.end} ({c.count} video{c.count === 1 ? "" : "s"})
+                </p>
+              ))}
+            </div>
+            <div className={styles.actions}>
+              <button
+                type="button"
+                className={`${styles.button} ${styles.buttonPrimary}`}
+                disabled={submitting}
+                onClick={() => handleConfirmChunking(view.payload, view.language, view.styleId, view.resolution)}
+              >
+                {submitting ? submitStatusLabel : `Confirm & generate ${view.plan.chunkCount} PDFs`}
+              </button>
+              <button
+                type="button"
+                className={styles.linkButton}
+                disabled={submitting}
+                onClick={() => setView({ kind: "picker", source: { type: "batch", payload: view.payload } })}
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
         )}
 
         {view.kind === "progress" && (
@@ -402,6 +702,60 @@ export default function NotesApp() {
             )}
 
             <p className={styles.hint}>This usually takes 30-60 seconds. Feel free to leave this open.</p>
+          </div>
+        )}
+
+        {view.kind === "batch-progress" && (
+          <div>
+            <p className={styles.title}>Generating your notes</p>
+            <p className={styles.subtitle}>
+              {view.jobs.filter((j) => j.status.stage === "done").length} of {view.jobs.length} PDF(s) ready.
+            </p>
+
+            {view.jobs.map((j, i) => (
+              <div key={j.jobId} style={{ marginBottom: 20 }}>
+                <p className={styles.stageLabel} style={{ marginBottom: 8 }}>
+                  PDF {i + 1} of {view.jobs.length}
+                  {j.status.chunkRange ? ` (videos ${j.status.chunkRange})` : ""}: {STAGE_LABELS[j.status.stage]}
+                </p>
+
+                {j.status.stage !== "error" && j.status.stage !== "done" && (
+                  <div className={styles.progressTrack}>
+                    <div className={styles.progressFill} style={{ width: `${j.status.progress}%` }} />
+                  </div>
+                )}
+
+                {j.status.stage === "error" && (
+                  <div className={styles.errorBox} style={{ marginBottom: 0 }}>
+                    <p className={styles.errorMessage}>{j.status.error}</p>
+                  </div>
+                )}
+
+                {j.status.stage === "done" &&
+                  (j.pdf.status === "ready" ? (
+                    <a
+                      href={j.pdf.blobUrl}
+                      download={j.pdf.filename}
+                      className={`${styles.button} ${styles.buttonPrimary}`}
+                      style={{ textAlign: "center", textDecoration: "none", display: "block" }}
+                    >
+                      Download PDF {i + 1}
+                    </a>
+                  ) : (
+                    <button type="button" className={`${styles.button} ${styles.buttonGhost}`} disabled>
+                      {j.pdf.status === "error" ? "Couldn't load PDF" : "Preparing download..."}
+                    </button>
+                  ))}
+              </div>
+            ))}
+
+            {view.jobs.every((j) => j.status.stage === "done" || j.status.stage === "error") && (
+              <button type="button" className={styles.linkButton} onClick={resetToStart}>
+                Generate another
+              </button>
+            )}
+
+            <p className={styles.hint}>This usually takes 30-60 seconds per PDF. Feel free to leave this open.</p>
           </div>
         )}
 

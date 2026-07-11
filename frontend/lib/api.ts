@@ -52,6 +52,13 @@ export interface StatusResponse {
   // rather than failing the whole batch, each with why.
   batchProgress?: string;
   skippedVideos?: { url: string; title: string; reason: string }[];
+  // Auto-chunked playlist flow only (see server.js's /generate) - links a
+  // chunk's job back to the sibling jobs it was split from, and where in
+  // the original playlist this chunk's videos fall (e.g. "21-40").
+  batchGroupId?: string;
+  chunkIndex?: number;
+  chunkCount?: number;
+  chunkRange?: string;
 }
 
 export class ApiError extends Error {
@@ -258,20 +265,120 @@ export async function generateNotes(
  */
 export type BatchPayload = { videoUrls: string[] } | { playlistUrl: string };
 
-export async function generateNotesBatch(payload: BatchPayload, options?: LanguageStyleOptions): Promise<{ jobId: string }> {
-  const requestId = crypto.randomUUID();
+/**
+ * What a playlist would auto-split into (see server.js's chunkPlaylistVideos)
+ * - only relevant when a playlist has more videos than fit in one chunk.
+ * Each chunk becomes its own independent pipeline run/PDF, so this is shown
+ * to the user as a quota-consumption warning ("N separate PDFs, N of your
+ * daily generations") requiring explicit confirmation before any of those
+ * N Gemini calls actually fire - see generateNotesBatch's confirmChunking
+ * option below.
+ */
+export interface PlaylistPlan {
+  totalVideos: number;
+  chunkSize: number;
+  chunkCount: number;
+  chunks: { index: number; start: number; end: number; count: number }[];
+}
+
+/** Same per-chunk shape as PlaylistPlan, but with each chunk's actual video
+ * URLs included - what /playlist/resolve returns (see resolvePlaylist below),
+ * needed by the client-side transcript prefetch loop (NotesApp.tsx's
+ * handleGenerate) to know which videos to fetch captions for before ever
+ * calling /generate. PlaylistPlan itself only carries counts/ranges (what
+ * the confirm-chunks screen displays) since /generate's own 409
+ * needsConfirmation response deliberately doesn't leak the full URL list. */
+export interface PlaylistResolution {
+  totalVideos: number;
+  chunkSize: number;
+  chunkCount: number;
+  chunks: { index: number; start: number; end: number; urls: string[] }[];
+}
+
+/**
+ * Resolves a playlist to its real per-video URLs, chunked the same way
+ * /generate's own auto-chunking would - called before every playlist
+ * submission now (not just ones that end up needing multiple chunks), since
+ * the client needs the actual video URLs to fetch each one's transcript
+ * client-side (see fetchTranscriptClientSide in lib/transcript.ts) before
+ * ever hitting /generate. This is the same Render-IP-blocking problem the
+ * single-video path already solved, just applied per-video here too.
+ */
+export async function resolvePlaylist(playlistUrl: string): Promise<PlaylistResolution> {
   let res: Response;
   try {
-    res = await fetchWithRetry(`${API_BASE_URL}/generate`, {
+    res = await fetchWithRetry(`${API_BASE_URL}/playlist/resolve`, {
       method: "POST",
       headers: authHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ ...payload, requestId, ...languageStyleFields(options) }),
+      body: JSON.stringify({ playlistUrl }),
     });
   } catch {
     throw new ApiError("Can't reach the server. Is it running?");
   }
   if (!res.ok) throw new ApiError(await parseErrorBody(res), res.status);
   return res.json();
+}
+
+export type GenerateBatchResult =
+  | { kind: "job"; jobId: string }
+  | { kind: "batch"; batchGroupId: string; jobIds: string[] }
+  | { kind: "needsConfirmation"; plan: PlaylistPlan };
+
+/**
+ * `confirmChunking` should only ever be sent as `true` after the user has
+ * seen and accepted the PlaylistPlan from a first call's `needsConfirmation`
+ * result - see NotesApp.tsx's confirm-chunks view. A first call without it
+ * either succeeds outright (playlist fits in one chunk, or a plain
+ * videoUrls[] batch - both return `{kind:"job"}` exactly as before this
+ * feature existed) or comes back as `{kind:"needsConfirmation"}` for a
+ * caller to act on, never silently firing multiple Gemini calls on its own.
+ */
+export async function generateNotesBatch(
+  payload: BatchPayload,
+  options?: LanguageStyleOptions & {
+    confirmChunking?: boolean;
+    // Per-video transcripts already fetched client-side (see
+    // NotesApp.tsx's prefetch loop, added to close the same Render-IP-
+    // blocking gap the single-video path's `clientTranscript` already
+    // solves) - keyed by the exact video URL fetched. A video missing from
+    // this map falls through to the server's own captions-then-yt-dlp/
+    // Whisper attempt, same as if this option were omitted entirely.
+    transcripts?: Record<string, { text: string; source: string }>;
+  }
+): Promise<GenerateBatchResult> {
+  const requestId = crypto.randomUUID();
+  const { confirmChunking, transcripts, ...styleOptions } = options ?? {};
+  let res: Response;
+  try {
+    res = await fetchWithRetry(`${API_BASE_URL}/generate`, {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({
+        ...payload,
+        requestId,
+        ...languageStyleFields(styleOptions),
+        ...(confirmChunking ? { confirmChunking: true } : {}),
+        ...(transcripts && Object.keys(transcripts).length > 0 ? { transcripts } : {}),
+      }),
+    });
+  } catch {
+    throw new ApiError("Can't reach the server. Is it running?");
+  }
+
+  if (res.status === 409) {
+    const body = await res.json().catch(() => null);
+    if (body?.needsConfirmation) {
+      return {
+        kind: "needsConfirmation",
+        plan: { totalVideos: body.totalVideos, chunkSize: body.chunkSize, chunkCount: body.chunkCount, chunks: body.chunks },
+      };
+    }
+  }
+  if (!res.ok) throw new ApiError(await parseErrorBody(res), res.status);
+
+  const body = await res.json();
+  if (body.batchGroupId) return { kind: "batch", batchGroupId: body.batchGroupId, jobIds: body.jobIds };
+  return { kind: "job", jobId: body.jobId };
 }
 
 export async function getStatus(jobId: string): Promise<StatusResponse> {

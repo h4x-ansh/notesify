@@ -1,0 +1,252 @@
+Notesify shortening audit
+
+Scope reviewed
+- Reviewed the hand-written source and config files under `src/`, `frontend/`, `electron/`, root scripts, and Android Gradle/Java/XML files.
+- Intentionally did not treat lockfiles, generated Capacitor files, Gradle wrapper files, binary assets, or checked-in generated blobs as places to hand-shorten.
+
+Bottom line
+- Most of the repo is not "waste of time" code.
+- The biggest excess is not raw business logic. It is:
+  1. comment density
+  2. repeated orchestration code
+  3. large UI state branching in one file
+  4. duplicated request helpers
+- A lot of files are already short enough and should not be shortened further just to save lines.
+
+Highest-value shortening targets
+
+1. `frontend/components/NotesApp.tsx`
+- This is the biggest simplification target in the repo.
+- It currently owns:
+  - startup health polling
+  - single-job polling
+  - batch polling
+  - PDF fetch lifecycle
+  - mobile save lifecycle
+  - view state machine
+  - screen rendering
+  - error handling
+- The file should be split into:
+  - `useServerHealth`
+  - `useJobPolling`
+  - `useBatchPolling`
+  - `usePdfDownload`
+  - small screen components like `ModeChoice`, `SingleInput`, `ProgressView`, `DoneView`, `ErrorView`
+- The `View` union is carrying too much UI branching.
+- There is also dead weight here: `confirm-chunks` state and `handleConfirmChunking()` exist, but there is no visible render branch for that view. That is both a bug and unnecessary file weight until implemented.
+
+2. `frontend/lib/api.ts`
+- This file has the clearest pure duplication.
+- The long doc block above `generateNotes()` is effectively repeated again above `generateNotesBatch()`.
+- `generateNotes()` and `generateNotesBatch()` repeat the same flow:
+  - build request id
+  - call `fetchWithRetry`
+  - catch network failure
+  - parse error
+  - parse response
+- Best cleanup:
+  - one shared `postGenerate(payload)` helper
+  - one shared network-error wrapper
+  - keep `generateNotes()` and `generateNotesBatch()` as thin builders
+
+3. `server.js`
+- The file is functional, but it is longer than it needs to be because the same job-launch pattern appears multiple times.
+- Repeated pattern:
+  - create job
+  - maybe attach `requestId`
+  - compute `outputPath`
+  - call `runPipeline()`
+  - attach `.catch()`
+- Best cleanup:
+  - `startJob(descriptor, options, requestId?)`
+  - `startChunkedPlaylist(plan, playlistUrl, language, styleId, requestId?)`
+  - `validateGenerateBody(req.body)`
+- Also a lot of the length is explanation comments. The comments are useful, but some of them belong in README-level design notes instead of inline above nearly every block.
+
+4. `src/pipeline.js`
+- The `playlistUrl` and `videoUrls` branches repeat the same batch logic:
+  - fetch transcripts
+  - count successes
+  - throw if zero
+  - merge
+  - summarize skipped
+- Best cleanup:
+  - `buildMergedTranscript(urls, emptyErrorMessage, sourceLabel, onUpdate)`
+- This would remove the near-duplicate blocks in the playlist and multi-video branches without changing behavior.
+
+5. `src/transcript.js`
+- The code is not especially complex. The comments are longer than the executable logic in several places.
+- The cookie setup and explanation are useful, but this file is over-documented inline.
+- Best cleanup:
+  - keep one top-level note
+  - shorten helper comments
+  - move environment-history details to README
+- Secondary cleanup:
+  - `setupCookiesFile()` and `buildCookieHeader()` are fine, but logging and parsing concerns could be grouped more tightly.
+
+6. `src/notesGenerator.js`
+- The provider fallback chain is solid, but the file is still longer than necessary.
+- Easy reductions:
+  - hoist `const primaryModel = process.env.GEMINI_MODEL || "gemini-2.5-flash"`
+  - reuse it instead of repeating the same expression
+  - keep the provider array, but reduce surrounding prose
+- The prompt rules are long, but that is legitimate product logic, not fluff.
+
+7. `src/template.js`
+- This is a large file, but it is large mostly because it combines many concerns:
+  - theme constants
+  - callout constants
+  - latex cleanup helpers
+  - HTML render helpers
+  - big inline CSS string
+  - final page template
+- Do not "shorten" this by golfing it.
+- Best cleanup is structural:
+  - move theme presets to `templateThemes.js`
+  - move callout config to `templateCallouts.js`
+  - move math/text helpers to `templateText.js`
+  - keep `renderNotesHtml()` focused on composition
+- That shortens the file without making the code worse.
+
+8. `electron/main.js`
+- Slightly verbose, but most of the length is explicit platform setup.
+- Best cleanup:
+  - move Chromium path candidates into a data structure
+  - extract backend spawn config
+  - extract logging/bootstrap helpers
+- Not a top-priority shortening target compared with `NotesApp.tsx`, `api.ts`, or `server.js`.
+
+9. `generate-notes.js`
+- Already pretty small.
+- Minor cleanup only:
+  - stage log messages could come from a map instead of a `switch`
+  - repeated `replace(/\.pdf$/i, ...)` could be a tiny helper
+- Not worth much effort.
+
+10. `scripts/benchmark.mjs`
+- This duplicates a lot of the same Puppeteer timing flow already present in `src/pdfExport.js`.
+- If kept, it should either:
+  - reuse a lower-level shared helper
+  - or clearly accept duplication because it is a one-off benchmarking script
+- Low priority.
+
+Files that are already concise enough
+
+- `src/jobStore.js`
+  - Already short and readable.
+  - Do not shorten further.
+
+- `src/errors.js`
+  - Short, focused, and easy to scan.
+  - Keep as is.
+
+- `src/pdfExport.js`
+  - Tight enough already.
+  - The only "extra" lines are legitimate timing collection.
+
+- `src/schema.js`
+  - Mostly declarative schema definitions.
+  - Not worth shortening unless you want to split the Gemini schema from the Zod schema.
+
+- `frontend/components/LanguageStylePicker.tsx`
+  - Already compact.
+  - Leave it alone.
+
+- `frontend/components/MultiLinkInput.tsx`
+  - Fairly lean.
+  - Small cleanup possible, but not a major source of waste.
+
+- `frontend/lib/downloadPdf.ts`
+  - Compact and reasonable.
+  - Leave it alone.
+
+- `frontend/lib/transcript.ts`
+  - Logic is short.
+  - Most "extra" size is explanatory comments.
+
+- `frontend/app/page.tsx`
+  - Already minimal.
+
+- `frontend/app/layout.tsx`
+  - Already minimal.
+
+- `frontend/app/globals.css`
+  - Already small and clean.
+
+- `frontend/components/NotesApp.module.css`
+  - Not bloated.
+  - Some comments could be shorter, but the CSS itself is fine.
+
+- `tailwind.config.js`
+  - Very small already.
+
+- `frontend/next.config.mjs`
+  - Already concise.
+
+- `frontend/capacitor.config.ts`
+  - Already concise enough.
+
+- `electron/preload.cjs`
+  - Tiny.
+
+- `electron-builder.config.mjs`
+  - Tiny.
+
+- `frontend/android/build.gradle`
+  - Very short already.
+
+- `frontend/android/app/build.gradle`
+  - Mostly standard Capacitor Android boilerplate.
+  - Not worth spending time shortening.
+
+- `frontend/android/variables.gradle`
+  - Normal version table, already fine.
+
+- `frontend/android/settings.gradle`
+  - Fine.
+
+- `frontend/android/app/src/main/java/com/hisarchives/notesify/MainActivity.java`
+  - Already one line of real logic.
+
+- `frontend/android/app/src/main/AndroidManifest.xml`
+  - Mostly necessary platform declarations, not waste.
+
+Files not worth auditing for shortening
+
+- `package-lock.json`
+- `frontend/package-lock.json`
+- `frontend/android/gradlew`
+- `frontend/android/gradlew.bat`
+- `frontend/android/capacitor.settings.gradle`
+- `frontend/android/app/capacitor.build.gradle`
+- `src/templates/noiseTexture.js`
+- binary files like `kickbacks.vsix`
+
+Concrete cleanup plan if the goal is fewer lines without hurting readability
+
+Phase 1
+- Split `frontend/components/NotesApp.tsx` into hooks and presentational screens.
+- Deduplicate `frontend/lib/api.ts`.
+- Factor repeated job-launch code out of `server.js`.
+
+Phase 2
+- Collapse shared batch logic in `src/pipeline.js`.
+- Reduce comment density in `src/transcript.js`, `src/notesGenerator.js`, and `server.js`.
+- Split `src/template.js` by concern instead of keeping one giant file.
+
+Phase 3
+- Decide whether one-off scripts should share lower-level helpers or stay intentionally duplicated.
+- Leave Android boilerplate and already-short files alone.
+
+What should not be done
+- Do not shorten files just to reduce line count if it makes the code denser or less debuggable.
+- Do not touch generated Capacitor or Gradle wrapper files for style cleanup.
+- Do not golf `src/template.js` or `server.js`; structural extraction is the right kind of shortening, not compression.
+
+Real answer
+- The repo does not need "every line" shortened.
+- It needs a few high-impact files decomposed.
+- If you only touch three places, touch:
+  1. `frontend/components/NotesApp.tsx`
+  2. `frontend/lib/api.ts`
+  3. `server.js`

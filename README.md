@@ -1216,3 +1216,192 @@ real downloaded PDFs - not mocks:**
 - **Invalid values rejected**: `language: "Klingon"` and `styleId: "neon"`
   each independently produced a `400` naming the allowlist, confirming
   the validation isn't just decorative.
+
+## Auto-chunking large playlists into multiple batches
+
+A playlist exceeding one chunk's worth of videos used to be hard-rejected
+outright (`playlist_too_large`, no way around it). It now auto-splits into
+sequential chunks instead - each chunk becomes its own independent pipeline
+run (own jobId, own Gemini call, own PDF), not one giant merged transcript.
+
+**Planning** (`chunkPlaylistVideos` in `src/playlist.js`): after resolving
+the full playlist via the existing `resolvePlaylistVideoUrls` (unbounded -
+no early rejection at resolution time anymore), the ordered video list is
+split into chunks of `PLAYLIST_CHUNK_SIZE` (20, unchanged from the old
+single-batch cap). `MAX_PLAYLIST_CHUNKS` (3) is a hard ceiling on top of
+that - a playlist needing more than 3 chunks (60+ videos) is still rejected
+outright with a clear message, *regardless of confirmation* - auto-chunking
+removes the old hard cap's inconvenience without removing the cap that
+actually matters (bounding how much quota one submission can consume).
+
+**Confirmation gate** (`server.js`'s `/generate`): when a playlist resolves
+to more than one chunk, the route responds `409` with
+`{needsConfirmation: true, totalVideos, chunkSize, chunkCount, chunks}`
+instead of creating any job at all - no yt-dlp-resolved chunk touches
+`runPipeline`, so zero Gemini calls fire, until the caller resubmits the
+identical request with `confirmChunking: true`. A playlist that fits in a
+single chunk skips this entirely and behaves exactly as it did before
+auto-chunking existed (same single-job response shape). Confirmed
+multi-chunk requests get a `batchGroupId` (linking the sibling jobs) and a
+`jobIds` array instead of a single `jobId`; each job's `meta` carries
+`batchGroupId`/`chunkIndex`/`chunkCount`/`chunkRange` so `/status` reflects
+which chunk of the original playlist each job covers.
+
+**Frontend**: `LanguageStylePicker`'s "Generate Notes" button still fires
+first without `confirmChunking` - if the response comes back as
+`needsConfirmation`, a new **confirm-chunks** screen
+(`NotesApp.tsx`) shows the exact breakdown ("This playlist has 47 videos -
+this will generate 3 separate note PDFs... and will use 3 of your daily
+generations") with a per-chunk video-range list, requiring an explicit
+"Confirm & generate N PDFs" click (or Cancel, back to the picker) before
+the confirmed request ever goes out. Once confirmed, a new
+**batch-progress** screen replaces the single-job progress view: one row
+per chunk (its own stage/progress bar, or its own error if that specific
+chunk failed independently), and a "Download PDF" link per chunk as each
+one finishes - polled at a slower 4s interval (vs. the single-job 2s) since
+up to 3 jobs are now polled concurrently, keeping combined request volume
+under the server's per-IP `/status` rate limit.
+
+**Verified with a real 32-video playlist, a real 100-video playlist, and a
+real browser - not mocks:**
+- **Confirmation gate blocks generation**: `POST /generate` with a real
+  32-video playlist (MIT 6.006, Fall 2011) and no `confirmChunking` -
+  `409 {needsConfirmation: true, totalVideos: 32, chunkCount: 2, chunks:
+  [{start:1,end:20,count:20},{start:21,end:32,count:12}]}`. Checked
+  `/debug/jobs` immediately after - **zero jobs created**, confirming no
+  Gemini call can fire before confirmation.
+- **Confirmed request dispatches real independent jobs**: same playlist
+  resubmitted with `confirmChunking: true` - `202
+  {batchGroupId, jobIds: [id1, id2]}`. Polled both jobs to completion:
+  chunk 2 (`chunkRange: "21-32"`) **completed for real** -
+  `transcriptSource: "batch-merged"`, `transcriptLength: 639770`,
+  `notesTitle: "Algorithms - Final Review"`, `pageCount: 11` - a title
+  that itself reflects the correct back-half-of-course video range, not
+  the whole playlist. Downloaded the real 4.7MB PDF (couldn't visually
+  re-render it in this environment - missing `poppler-utils`, the same
+  infra gap noted for the earlier large-playlist test - so this is
+  confirmed via the job's own structural metadata rather than a page-by-
+  page read, same caveat as before). Chunk 1 (`chunkRange: "1-20"`) hit a
+  **real, legitimate** Gemini free-tier input-token quota limit
+  (transcript was 1,009,041 chars from 20 full-length lecture videos,
+  quota is 250,000 tokens/minute) with the Groq fallback also rejecting
+  for length - a genuine pre-existing limit of the notes-generation step
+  when a chunk's total transcript is enormous, unrelated to the chunking
+  logic itself. What actually matters for this feature held up: chunk 1's
+  failure was fully isolated to its own job/PDF and **did not affect
+  chunk 2**, which completed normally - exactly the resilience
+  independent-per-chunk jobs are meant to provide.
+- **Ceiling rejection survives confirmation**: a real 100-video playlist
+  (a channel's full uploads list) with `confirmChunking: true` sent from
+  the start - still hard-rejected, `400 {"error":"This playlist has 100
+  videos, which would need 5 batches of up to 20 videos each - over the
+  3-batch limit (60 videos max) for one submission...",
+  "errorCode":"playlist_too_large"}`. Confirms the ceiling can't be
+  bypassed by pre-emptively setting `confirmChunking`.
+- **Real browser walkthrough** (Puppeteer against the live server and a
+  real static frontend build): pasted the 32-video playlist link ->
+  picker -> "Generate Notes" -> landed on the confirm-chunks screen
+  showing the exact real numbers ("This playlist has 32 videos - this
+  will generate 2 separate note PDFs...", "PDF 1: videos 1-20 (20
+  videos)", "PDF 2: videos 21-32 (12 videos)") - confirmed zero
+  `confirmChunking:true` requests had fired yet. Clicked **Cancel** -
+  returned to the picker screen, still zero confirmed requests. Went
+  through again and clicked **Confirm & generate 2 PDFs** - confirmed
+  exactly one `confirmChunking:true` request fired, landing on the
+  batch-progress screen showing "0 of 2 PDF(s) ready." with a
+  "PDF 1 of 2: Queued..." / "PDF 2 of 2: Queued..." row each, backed by
+  the same real `batchGroupId`/`jobIds` dispatch verified above.
+
+## Closing the client-side transcript fetch gap in the batch/playlist paths
+
+The single-video flow has fetched transcripts client-side since the caption-
+fetch investigation (see the README section above) - specifically to use the
+client's own IP instead of Render's, which YouTube has been blocking. That
+fix was never applied to the batch paths: `videoUrls[]`, a resolved single
+playlist, and the new chunked-playlist flow were all still sending raw video
+URLs straight to `/generate`, silently falling back to the exact same
+server-side (Render-IP) captions/yt-dlp attempt per video the single-video
+fix was meant to avoid - confirmed by reading `NotesApp.tsx`'s `handleGenerate`,
+whose batch branch called `generateNotesBatch` directly with no
+`fetchTranscriptClientSide` call anywhere in that path, and by a comment
+left in the code at the time explicitly noting the batch path "still isn't
+attempted" for client-side fetching.
+
+**Fix - client-side-fetch-first now applies uniformly to every video-
+selection path:**
+
+- **`videoUrls[]`** (individually pasted links): `handleGenerate` now runs
+  `prefetchTranscripts()` over the array before ever calling `/generate`.
+- **A playlist that fits in one chunk**: the client can't client-side-fetch
+  transcripts for videos it doesn't have URLs for yet, and a `playlistUrl`
+  string alone doesn't reveal them - so a new `POST /playlist/resolve`
+  endpoint (`server.js`, reusing the existing `resolvePlaylistVideoUrls`/
+  `chunkPlaylistVideos` from the auto-chunking work) resolves the playlist to
+  its real per-video URLs *before* `/generate` is ever called. `handleGenerate`
+  calls this first, then prefetches over the resolved URLs.
+- **The chunked-playlist flow**: the same resolution (now including raw
+  per-chunk URLs, not just counts) is reused by the confirm-chunks screen -
+  `handleConfirmChunking` prefetches across every chunk's videos
+  (`resolution.chunks.flatMap(c => c.urls)`) after the user confirms, before
+  the confirmed request goes out.
+
+**`prefetchTranscripts()`** (`NotesApp.tsx`) fetches sequentially (not in
+parallel) so progress can report a clean "N of M" count and so this doesn't
+burst YouTube with concurrent requests from one client. A video whose
+client-side fetch fails or wasn't available (e.g. no captions, or running in
+a plain browser where neither the Electron IPC bridge nor Capacitor's native
+`fetch` patch applies) is simply omitted from the resulting map - the same
+partial-success policy the server-side batch path already had: that video
+falls through to the server's own captions-then-yt-dlp/Whisper attempt,
+unaffected, rather than failing the whole batch.
+
+**Backend**: `/generate` now accepts an optional `transcripts` field - a map
+of exact video URL -> `{text, source}`, validated the same way the existing
+single-video `transcript` field is (non-empty, under `MAX_TRANSCRIPT_LENGTH`,
+capped at `PLAYLIST_CHUNK_SIZE * MAX_PLAYLIST_CHUNKS` entries). Threaded into
+`runPipeline` as `preFetchedTranscripts` for all three call sites
+(`videoUrls`, `playlistUrl`, and each chunk in the confirmed multi-chunk
+dispatch loop). `pipeline.js`'s `fetchAndMergeTranscripts` checks this map
+per video before calling `getTranscript()` - a URL present in the map skips
+the server-side attempt entirely, same mechanism the single-video
+`preFetchedTranscript` option already used, just applied per-video across a
+batch instead of to one video.
+
+**Progress UI**: the picker/confirm-chunks screen's submit button shows
+"Fetching transcripts on-device (N of M)..." while the prefetch loop runs,
+updating live per video - a genuinely visible step, not just a spinner -
+before switching to "Starting..." once the request actually goes out.
+
+**Verified with a real Electron app (not a plain browser, which can't
+exercise the client-side fetch path at all - see `fetchTranscriptClientSide`'s
+own doc comment) and real videos - not mocks:**
+- **`videoUrls[]` batch, 2 real videos** ("Me at the zoo" + a Korean-
+  language music video): drove the actual Electron app end-to-end - Multiple
+  videos -> two pasted links -> picker -> Generate. Watched the submit
+  button's label genuinely cycle through "Fetching transcripts on-device (1
+  of 2)..." then "(2 of 2)..." before any `/generate` call. Captured the
+  real request body - `transcripts` carried real prefetched text for both
+  videos (217 chars of real English captions for the first, 654 chars of
+  real Korean lyrics for the second, `source: "captions"` for both).
+- **Server-side fetch confirmed skipped**: checked Electron's own backend
+  log (`main.log`, captures the spawned server.js's stdout/stderr) for that
+  job - it jumps directly from `[generate] batch request received` straight
+  to the Gemini call log line, with **zero** `[transcript] captions
+  fetch...` lines for either video - the exact log line that fires on every
+  server-side captions attempt (see `src/transcript.js`), confirmably
+  absent here. (The Gemini call itself then hit a real, pre-existing free-
+  tier quota exhaustion unrelated to this fix - not a concern for what's
+  being verified, transcript fetching happens before that step.)
+- **Single-chunk playlist, 13 real videos**: same walkthrough with a real
+  13-video playlist. Confirmed `POST /playlist/resolve` fired before
+  `/generate` (`{playlistUrl}` body, matching what was pasted). Watched the
+  submit label progress through "Looking up playlist..." then "Fetching
+  transcripts on-device (1 of 13)..." up through "(13 of 13)...". The
+  resulting `/generate` body carried a `transcripts` map with all 13 real
+  entries, non-empty text for every one. Backend log again jumped directly
+  from `[generate] batch request received` to the Gemini call - no
+  server-side transcript-fetch attempts for any of the 13 videos.
+- The confirmed multi-chunk dispatch path (`handleConfirmChunking`) reuses
+  this exact same `prefetchTranscripts`/`generateNotesBatch` mechanism -
+  already proven above - the only difference is flattening multiple chunks'
+  URLs into one prefetch pass before submitting with `confirmChunking: true`.

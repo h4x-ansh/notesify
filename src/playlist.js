@@ -62,6 +62,46 @@ export async function resolvePlaylistVideoUrls(playlistUrl, { maxVideos } = {}) 
   return ids.map((id) => `https://www.youtube.com/watch?v=${id}`);
 }
 
+// Per-chunk cap (unchanged from the original single-batch limit) and a hard
+// ceiling on how many chunks one submission can auto-split into - without
+// the ceiling, a single request against an arbitrarily large playlist could
+// silently queue an unbounded number of Gemini calls. 3 chunks x 20 videos
+// = 60 videos is the most one /generate call can ever trigger.
+export const PLAYLIST_CHUNK_SIZE = 20;
+export const MAX_PLAYLIST_CHUNKS = 3;
+
+/**
+ * Splits an already-resolved, ordered list of video URLs into sequential
+ * chunks of at most `chunkSize`, each becoming its own independent pipeline
+ * run (own jobId, own Gemini call, own PDF) rather than one giant merged
+ * transcript - see server.js's /generate. Pure/synchronous: the playlist
+ * itself is already resolved by the time this runs (resolvePlaylistVideoUrls
+ * above), so this never touches yt-dlp.
+ *
+ * Throws if the playlist would need more than `maxChunks` chunks - that's
+ * the hard ceiling, enforced regardless of user confirmation, since
+ * unlimited auto-chunking would let one submission consume unlimited quota.
+ */
+export function chunkPlaylistVideos(urls, { chunkSize = PLAYLIST_CHUNK_SIZE, maxChunks = MAX_PLAYLIST_CHUNKS } = {}) {
+  const totalVideos = urls.length;
+  const chunkCount = Math.ceil(totalVideos / chunkSize);
+
+  if (chunkCount > maxChunks) {
+    throw new PipelineError(
+      `This playlist has ${totalVideos} videos, which would need ${chunkCount} batches of up to ${chunkSize} videos each - over the ${maxChunks}-batch limit (${maxChunks * chunkSize} videos max) for one submission. Try a shorter playlist.`,
+      "playlist_too_large"
+    );
+  }
+
+  const chunks = [];
+  for (let i = 0; i < totalVideos; i += chunkSize) {
+    const slice = urls.slice(i, i + chunkSize);
+    chunks.push({ index: chunks.length, start: i + 1, end: i + slice.length, urls: slice });
+  }
+
+  return { totalVideos, chunkSize, chunkCount: chunks.length, chunks };
+}
+
 /**
  * Best-effort title lookup for a single video - used to label each video's
  * section in the merged transcript (see pipeline.js's mergeTranscripts) and

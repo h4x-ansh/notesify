@@ -5,17 +5,22 @@ import { generateNotes } from "./notesGenerator.js";
 import { renderNotesHtml } from "./template.js";
 import { exportHtmlToPdf } from "./pdfExport.js";
 import { classifyError, PipelineError } from "./errors.js";
-import { resolvePlaylistVideoUrls, fetchVideoTitle } from "./playlist.js";
+import { resolvePlaylistVideoUrls, fetchVideoTitle, PLAYLIST_CHUNK_SIZE } from "./playlist.js";
 
 // Applied after resolving a playlist to its actual video list (yt-dlp's
 // --flat-playlist has to run before the count is known - see
 // resolvePlaylistVideoUrls) - a caller pointing at a 200-video playlist
 // should get a clear rejection, not a bill for 200 Gemini-input transcripts
 // merged into one call. server.js separately caps a direct `videoUrls[]`
-// array at request-validation time (MAX_BATCH_VIDEOS, currently 25); this
-// is the playlist-specific equivalent, enforced here instead since it can
-// only be checked after resolution.
-const MAX_PLAYLIST_VIDEOS = 20;
+// array at request-validation time (MAX_BATCH_VIDEOS, currently 25).
+//
+// This single-job cap only applies when runPipeline is called directly with
+// a playlistUrl (CLI/programmatic use, or a playlist that already fits in
+// one chunk) - server.js's /generate route now resolves+auto-chunks larger
+// playlists itself (see src/playlist.js's chunkPlaylistVideos) and calls
+// this function once per chunk via `videoUrls` instead, so a chunked
+// playlist never actually hits this branch/cap at all.
+const MAX_PLAYLIST_VIDEOS = PLAYLIST_CHUNK_SIZE;
 
 /**
  * Fetches each video's transcript in order via the existing single-video
@@ -31,7 +36,7 @@ const MAX_PLAYLIST_VIDEOS = 20;
  * disabled. Every skip is recorded with its reason so it surfaces in job
  * metadata (see runPipeline below), not silently dropped.
  */
-async function fetchAndMergeTranscripts(urls, onUpdate) {
+async function fetchAndMergeTranscripts(urls, onUpdate, preFetchedTranscripts = null) {
   const results = [];
 
   for (let i = 0; i < urls.length; i++) {
@@ -43,6 +48,19 @@ async function fetchAndMergeTranscripts(urls, onUpdate) {
     });
 
     const title = await fetchVideoTitle(url);
+    // Mirrors the single-video preFetchedTranscript check below - a video
+    // the client already fetched captions for client-side (see the
+    // frontend's per-video prefetch loop) skips getTranscript() entirely,
+    // same reasoning as the single-video path: use the client's own IP
+    // instead of this server's (Render's, when hosted), which YouTube has
+    // been blocking. Missing/empty entries fall through to the exact same
+    // server-side captions-then-yt-dlp/Whisper flow as before, per video.
+    const preFetched = preFetchedTranscripts?.[url];
+    if (preFetched?.text) {
+      results.push({ url, title, text: preFetched.text, source: preFetched.source || "captions-client" });
+      continue;
+    }
+
     try {
       const { text, source } = await getTranscript(url);
       results.push({ url, title, text, source });
@@ -111,6 +129,14 @@ function summarizeSkipped(results) {
  * unset is a no-op) and renderNotesHtml() (template.js swaps a CSS-variable
  * color preset, unset/unknown falls back to the original "classic" colors).
  * Both apply the same way regardless of single-video/batch/playlist source.
+ *
+ * `preFetchedTranscripts` (plural, distinct from the single-video
+ * `preFetchedTranscript` above) is the batch/playlist equivalent - a map of
+ * video URL -> {text, source} for whichever videos the client already
+ * fetched captions for itself (see the frontend's per-video prefetch loop,
+ * added to close the same Render-IP-blocking gap the single-video path
+ * already solved). Passed straight through to fetchAndMergeTranscripts,
+ * which checks it per video before falling back to getTranscript().
  */
 export async function runPipeline(
   youtubeUrl,
@@ -118,6 +144,7 @@ export async function runPipeline(
   {
     onUpdate = () => {},
     preFetchedTranscript = null,
+    preFetchedTranscripts = null,
     videoUrls = null,
     playlistUrl = null,
     language = null,
@@ -134,7 +161,7 @@ export async function runPipeline(
       onUpdate({ stage: "extracting_transcript", progress: 5, meta: { batchProgress: "Resolving playlist..." } });
       const urls = await resolvePlaylistVideoUrls(playlistUrl, { maxVideos: MAX_PLAYLIST_VIDEOS });
 
-      const results = await fetchAndMergeTranscripts(urls, onUpdate);
+      const results = await fetchAndMergeTranscripts(urls, onUpdate, preFetchedTranscripts);
       const successCount = results.length - results.filter((r) => r.skipped).length;
       if (successCount === 0) {
         throw new PipelineError("Couldn't get a transcript for any video in this playlist.", "transcript_unavailable");
@@ -143,7 +170,7 @@ export async function runPipeline(
       source = "playlist-merged";
       skippedVideos = summarizeSkipped(results);
     } else if (videoUrls) {
-      const results = await fetchAndMergeTranscripts(videoUrls, onUpdate);
+      const results = await fetchAndMergeTranscripts(videoUrls, onUpdate, preFetchedTranscripts);
       const successCount = results.length - results.filter((r) => r.skipped).length;
       if (successCount === 0) {
         throw new PipelineError("Couldn't get a transcript for any of the provided videos.", "transcript_unavailable");
