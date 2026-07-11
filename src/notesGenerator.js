@@ -57,8 +57,21 @@ const JSON_SHAPE_INSTRUCTIONS = `Respond with ONLY a raw JSON object - no markdo
 // exam-ready notes" in SYSTEM_PROMPT. The JSON shape/schema requirements
 // are deliberately untouched by this - only the depth/thoroughness framing
 // differs between providers, never the output contract.
+//
+// The quantified guidance below (bullet counts, "walk through step by
+// step") was added after investigating a real report that Groq's output
+// still read short even with this instruction in place - confirmed via a
+// real call that this was never a token-limit/truncation issue
+// (finish_reason: "stop", well under Groq's model max, and see
+// generateWithGroq's comment on why an explicit max_completion_tokens is
+// actively the wrong fix here) - Llama was choosing brevity, not being cut
+// off. A vaguer "include more detail" framing left that choice to the
+// model's own judgment; concrete numbers/actions leave less room for a
+// model that defaults to terse to interpret its way back to a short answer.
 const THOROUGHNESS_INSTRUCTIONS = `
-Additional emphasis: do not summarize sparsely. Include all examples, sub-points, and elaborations present in the source material. Err on the side of more detail per section, not less. Match the depth and thoroughness of a comprehensive study guide, not a brief summary.`;
+Additional emphasis: do not summarize sparsely. Include all examples, sub-points, and elaborations present in the source material. Err on the side of more detail per section, not less. Match the depth and thoroughness of a comprehensive study guide, not a brief summary.
+Aim for at least 4-6 bullets per section whenever the source material supports it - do not compress multiple distinct points into a single bullet. If the transcript walks through a worked example or a multi-step process, break it into separate bullets for each step rather than one summary line. When unsure whether a sub-point is worth including, include it rather than cut it.
+Do not hit this bullet count by padding with generic restatements - each bullet must carry a specific, distinct fact, number, formula, or step from the transcript. Preserve every concrete detail the source gives: named formulas (in LaTeX), specific values, technical terms, and named examples. Still use "callout" and "formula" wherever the transcript content warrants one - more bullets is not a reason to drop them.`;
 
 // English is the default/omitted case - no instruction added, so an old
 // request with no `language` field (or one explicitly set to "English")
@@ -141,6 +154,19 @@ async function generateWithGemini(transcript, title, modelName, language, { thor
   return parseAndValidate(result.response.text(), modelName);
 }
 
+// Deliberately no explicit `max_completion_tokens` here - checked directly
+// against a real call (see README's Groq output-depth investigation):
+// finish_reason came back "stop", not "length", with completion_tokens
+// (~1100-1300 for a ~33K-char transcript) well under Llama 3.3 70B's real
+// 8192-token ceiling - the shorter-than-Gemini output was never a
+// truncation problem. Explicitly raising max_completion_tokens toward that
+// ceiling was tried and made things *worse*: Groq's free-tier TPM (tokens
+// per minute) limit counts the requested max toward the same budget as
+// prompt_tokens, so requesting a high completion budget on top of an
+// already-substantial prompt triggered a real 413 "Request too large...
+// TPM Limit 12000" rejection that omitting the parameter entirely doesn't
+// hit. The actual fix for terse output is prompt wording (see
+// THOROUGHNESS_INSTRUCTIONS' quantified guidance), not a token cap.
 async function generateWithGroq(transcript, title, language) {
   if (!process.env.GROQ_API_KEY) {
     throw new Error("GROQ_API_KEY is not set - cannot use Groq as a fallback provider.");

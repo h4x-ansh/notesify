@@ -1611,3 +1611,84 @@ spending real Gemini calls):**
   fields anywhere in the output, and the template rendered with no
   `timestamp-tag` markup at all - confirming the feature is fully
   additive, never a hard dependency for generation to succeed.
+
+## Investigating "Groq output still reads short" - not a token limit
+
+A real report came in that Groq's output still read short/less detailed
+even after the `THOROUGHNESS_INSTRUCTIONS` addition above (verified at the
+time via isolated A/B testing showing +23% average bullet length). Rather
+than assume the fix "should theoretically help," this was investigated
+against the real API.
+
+**Hypothesis 1 - `max_tokens` capping output length: disproven.** A real
+Groq call with no `max_completion_tokens` set (today's code, unchanged)
+came back with `finish_reason: "stop"`, not `"length"` - the model
+completed its response naturally. `usage.completion_tokens` was ~1100-1300
+for a ~33K-char real transcript, well under Llama 3.3 70B's real 8,192-
+token ceiling (confirmed via Groq's own model docs). There was no
+truncation to fix.
+
+**Testing the "fix" anyway - actively harmful, not just unhelpful.**
+Explicitly setting `max_completion_tokens: 8192` (the model's real max, as
+the hypothesis would suggest) on the *same* real request produced a real
+`413 "Request too large for model llama-3.3-70b-versatile ... on tokens
+per minute (TPM): Limit 12000, Requested 16254"` rejection. Groq's
+free-tier TPM (tokens-per-minute) rate limit counts the *requested*
+`max_completion_tokens` against the same budget as `prompt_tokens`, not
+just actual usage - a substantial transcript's prompt tokens (8,062 here)
+plus a high requested completion budget can blow the 12,000 TPM ceiling
+outright, failing a request that would have succeeded with the parameter
+left unset. Raising `max_completion_tokens` was **not** applied to the
+code - doing so would make real requests on realistically-sized
+transcripts fail, not just fail to help. `src/notesGenerator.js`'s
+`generateWithGroq` now has a comment recording this so nobody re-attempts
+the same fix without re-reading this finding first.
+
+**`THOROUGHNESS_INSTRUCTIONS` confirmed reaching the real request** - the
+exact system message string sent to a real call was captured and checked
+directly for the instruction text, confirming it wasn't silently dropped
+anywhere in the provider-branching logic.
+
+**Real root cause: the model was choosing brevity, not being cut off** -
+a genuine model-behavior difference from Gemini 2.5 Flash, not a
+configuration bug. The actual lever that can influence this is prompt
+wording, not a token ceiling. `THOROUGHNESS_INSTRUCTIONS` was strengthened
+with concrete, quantified guidance ("aim for at least 4-6 bullets per
+section," "break a worked example into separate bullets per step") rather
+than only qualitative framing ("include more detail") - a model defaulting
+to terse has less room to interpret its way back to a short answer against
+a specific number than against a vague instruction.
+
+**Verified with real calls, and the result reported honestly rather than
+rounded up to a clean win:**
+- A first strengthened version (bullet-count guidance alone) measurably
+  increased bullet count and made section-to-section bullet counts far
+  more consistent (6 of 8 sections landing exactly on 4 bullets, versus a
+  more scattered 2-4 spread before) - but a side-by-side read of the
+  actual bullet text showed this specific run leaning more generic
+  ("Algorithms can be described using words or code") and dropping LaTeX
+  formula notation and callouts entirely compared to earlier runs that had
+  included them.
+- Since "more bullets, more generic" isn't the actual goal, the
+  instruction was refined again with an explicit anti-padding clause
+  ("each bullet must carry a specific, distinct fact... more bullets is
+  not a reason to drop \[callout/formula\]"). A follow-up real call showed
+  every section hitting 4+ bullets (up to 6 in one), but still read
+  somewhat generic in that particular sample - and a subsequent full
+  end-to-end real call through the actual public `generateNotes()` chain
+  (forcing Gemini to fail so it lands on real Groq, same technique used
+  throughout this project) produced a *third*, quite different shape
+  again (13 sections, 2-4 bullets each).
+- **Honest conclusion**: Groq/Llama's real output has substantial natural
+  run-to-run variance independent of prompt wording (expected - this is
+  sampling, not a deterministic API), which one-call-per-variant testing
+  can't fully separate from an actual prompt effect. What's confirmed with
+  confidence: the token-limit hypothesis is definitively ruled out (real
+  `finish_reason`/`usage` evidence, plus a real demonstration that
+  "fixing" it would actively break requests), and the quantified bullet
+  guidance does reliably push bullet *counts* up and more consistent
+  across the several real runs sampled. Whether it reliably preserves
+  per-bullet *depth* (formulas, callouts, specific figures) as robustly
+  as count is a real open question this session's sample size can't fully
+  settle - flagged here rather than claimed resolved, consistent with how
+  every other finding in this README is reported.
