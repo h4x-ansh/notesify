@@ -1692,3 +1692,168 @@ rounded up to a clean win:**
   as count is a real open question this session's sample size can't fully
   settle - flagged here rather than claimed resolved, consistent with how
   every other finding in this README is reported.
+
+## Fixing `build:mobile` silently baking in `.env.local` instead of `.env.mobile`
+
+`npm run build:mobile` used to be `dotenv -e .env.mobile -- next build` -
+injecting `.env.mobile`'s values into the child process's environment
+before `next build` ran, on the assumption that already-set `process.env`
+values win per Next.js's documented env-loading precedence
+(`process.env` → `.env.$(NODE_ENV).local` → `.env.local` → ... → `.env`).
+In practice, whether that actually holds depends on the installed
+Next.js/dotenv-cli versions' own env-loading behavior - Next's own env
+loader independently discovers and loads `.env.local`, and the two tools'
+precedence rules don't compose in a way either one documents clearly (see
+real-world reports of the same interaction:
+[dotenv will not overwrite an already-defined variable, by design](https://github.com/vercel/next.js/discussions/38053)).
+The failure mode is silent either way - a `.env.local` present locally
+(the normal state for Electron dev, pointing at
+`http://localhost:4500`) can end up baked into a build meant for a real
+device talking to the hosted Render backend, and the build itself reports
+success regardless - nothing looks wrong until the app is actually
+installed and can't reach anything.
+
+**Fix, in two independent layers** (`frontend/scripts/build-mobile.mjs`,
+replacing the old one-line dotenv-cli invocation):
+
+1. **`.env.local` is renamed out of the way before the build runs**, not
+   deleted - moved to `.env.local.mobile-build-backup` and restored in a
+   `finally`, so it comes back even if the build itself throws or exits
+   non-zero. This removes the ambiguity about precedence entirely instead
+   of depending on getting it right: Next's own env loader simply can't
+   find a `.env.local` that isn't there. `.env.mobile`'s values are parsed
+   directly via the `dotenv` package and passed straight into the spawned
+   `next build` process's `env`, so there's no second CLI layer's own
+   precedence rules to reason about either (dotenv-cli itself is no longer
+   used for this - removed from `devDependencies`, `dotenv` added
+   directly since the script now uses it itself rather than transitively
+   through dotenv-cli).
+2. **A build-time assertion after a successful build** - the static
+   output (`out/`) is grepped for a literal `http://localhost`; fails
+   loudly (non-zero exit, lists every offending file) if found. This is
+   deliberately independent of whether layer 1 worked - it catches *any*
+   future regression (a Next.js upgrade changing env-loading behavior
+   again, a new hardcoded `localhost` reference added somewhere else
+   entirely), not just the one specific mechanism already fixed.
+
+**Verified for real, with `.env.local` present throughout (not deleted -
+that defeats the point of the fix):**
+- Ran `npm run build:mobile` with a real `.env.local` (pointing at
+  `http://localhost:4500`, the normal Electron-dev state) sitting in the
+  frontend directory the whole time. Direct `grep` of the real output
+  confirms **zero** occurrences of `localhost:4500` anywhere in `out/`,
+  and the real Render URL (`onrender.com`) present in the actual bundled
+  JS - not inferred from the build log, checked directly against the
+  files.
+- **`.env.local` restoration confirmed on both paths**: after a
+  successful build, `.env.local` exists again with byte-identical content
+  and no leftover `.env.local.mobile-build-backup`. Also forced a real
+  build *failure* (temporarily renamed away the `next` binary so
+  `spawnSync` fails) and confirmed `.env.local` is still restored and the
+  script still exits non-zero - the `finally` block covers both outcomes,
+  not just the happy path.
+- **The assertion itself verified to actually catch a leak**, not just
+  exist decoratively - ran its exact detection logic against a
+  deliberately-planted `http://localhost` string in a fake output
+  directory and confirmed it's correctly flagged as an offending file.
+- **No regression on the Electron target**: plain `npm run build` (still
+  untouched, still just `next build`) continues to correctly bake in
+  `http://localhost:4500` from `.env.local` as intended for that target -
+  this fix only changes the mobile build's isolation from `.env.local`,
+  not `.env.local`'s own normal effect on the default build.
+- Full pipeline re-run end to end: `build:mobile` → `cap sync android` -
+  confirmed the Render URL (not localhost) in the actual synced Android
+  assets (`android/app/src/main/assets/public/`), and rebuilt the Electron
+  target afterward to leave both build outputs current.
+
+## Note-quality tier picker (High/Normal/Low)
+
+A third picker alongside language/style, giving explicit control over which
+provider(s) generate a job's notes, instead of always running the same
+universal fallback chain regardless of what a user actually wanted.
+
+**Mapping** (`src/notesGenerator.js`'s `buildProvidersForTier`):
+- **High** -> `gemini-2.5-flash` only.
+- **Normal** (default) -> `groq-llama-3.3-70b`, cascading to
+  `gemini-3.1-flash-lite` if Groq fails.
+- **Low** -> `gemini-3.1-flash-lite` only.
+
+**Asymmetric by design - each tier is its own closed provider list, not a
+shared cascade:**
+- **High never cascades.** A user who explicitly picked High chose to
+  wait for (or be told no about) `gemini-2.5-flash` specifically -
+  silently downgrading them to Groq/Flash-Lite would defeat the entire
+  point of picking it. If it fails, the job fails immediately with:
+  *"High quality is unavailable right now (daily limit reached). Try
+  Normal or Low, or wait until tomorrow."*
+- **Normal cascades down to Flash-Lite, never up to High.** Falling up
+  into `gemini-2.5-flash` would let a Normal-tier request quietly consume
+  High's much scarcer daily quota - exactly what tiering exists to
+  prevent. If both steps fail: *"Normal quality is unavailable right now
+  (daily limit reached on both providers). Try High or Low, or wait until
+  tomorrow."*
+- **Low never cascades further** - it's already the cheapest/last-resort
+  model, there's nowhere lower to fall to. If it fails: *"Low quality is
+  unavailable right now. Try Normal or High, or wait until tomorrow."*
+
+**Thoroughness is tier-based, not hardcoded to a model's identity** -
+`THOROUGHNESS_INSTRUCTIONS` (see the earlier Groq-depth investigation
+above) is applied by `buildProvidersForTier` based on which tier is
+routing to a given provider, not by checking the model name inside
+`generateWithGemini`/`generateWithGroq`. In practice this means
+`gemini-3.1-flash-lite` gets it in *both* the Normal and Low tiers (same
+model, same reasoning, wherever it's routed from) while `gemini-2.5-flash`
+never does - but the assignment lives at the tier level, so a future tier
+remix would follow from wherever a model gets slotted in, not from a
+per-model special case.
+
+**Whichever provider actually answers is tracked and surfaced**: `generateNotes()`
+returns `{ notes, providerUsed, cascaded }` (`cascaded` only ever `true`
+for Normal, the only tier with more than one step) alongside the existing
+`console.log("generated via fallback provider: ...")`. `pipeline.js`
+surfaces this as `notesProvider`/`providerCascaded` in job metadata -
+`providerCascaded` is only present at all when `true`, so a straightforward
+single-provider tier succeeding on its first try doesn't carry a dead
+`false` field forever (same pattern as `skippedVideos`). The "done" screen
+shows *"Generated via \[provider\] (the first-choice provider was
+unavailable)"* only when `providerCascaded` is set - invisible for the
+common case, informative when a fallback actually happened.
+
+**Verified with real forced-failure tests (same technique as the earlier
+provider-fallback work) - not mocks:**
+- **High, `gemini-2.5-flash` forced to fail**: real call through
+  `generateNotes({qualityTier: "High"})` - threw the exact specified
+  message, and a request-tracking check confirmed **zero** calls ever
+  reached Groq or Flash-Lite - it genuinely doesn't cascade, not just
+  "cascades to nothing by coincidence."
+- **Normal, Groq forced to fail**: cascaded to a real
+  `gemini-3.1-flash-lite` call - `providerUsed`/`cascaded` came back
+  correctly, and `gemini-2.5-flash` was **never** called (confirmed via
+  the same tracking) - Normal doesn't fall *up* into High's quota.
+  Re-verified end to end through a real browser: submitted a real job
+  through the actual picker UI against a live backend with Groq's real
+  endpoint forced to fail, and the **"done" screen genuinely displayed**
+  *"Generated via gemini-3.1-flash-lite (the first-choice provider was
+  unavailable)"* - not inferred from job metadata, read directly off the
+  rendered page.
+- **Low, `gemini-3.1-flash-lite` forced to fail**: threw the exact
+  specified Low message; confirmed neither Groq nor `gemini-2.5-flash`
+  was ever called - no further cascade.
+- **Default (no `qualityTier` at all) behaves as Normal**: called
+  `generateNotes()` with the option omitted entirely, Groq forced to fail
+  - cascaded to Flash-Lite exactly like an explicit `"Normal"` would.
+  Confirmed the same at the HTTP/UI level too - a real submission with the
+  picker left on its default selection sent a request with `qualityTier`
+  omitted entirely (same `languageStyleFields` omit-the-default pattern as
+  language/style), and still cascaded/displayed identically to an
+  explicit Normal request.
+- **Real (unforced) HTTP smoke test of all three tiers**: submitted one
+  real job per tier directly against a live backend with no failures
+  forced - High completed via `gemini-2.5-flash`, Normal via
+  `groq-llama-3.3-70b` (no cascade needed today), Low via
+  `gemini-3.1-flash-lite` - each job's `/status` correctly reported
+  `notesProvider` matching the tier picked, confirming the everyday,
+  nothing-failing path works exactly as the forced-failure tests implied
+  it would.
+- **Invalid `qualityTier` rejected**: `{"qualityTier":"Ultra"}` against
+  the live server correctly 400s with the allowlist message.

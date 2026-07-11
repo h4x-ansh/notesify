@@ -2,14 +2,24 @@
 
 import { useState } from "react";
 import styles from "./NotesApp.module.css";
-import { SUPPORTED_LANGUAGES, STYLE_PRESETS, type Language } from "@/lib/api";
+import { SUPPORTED_LANGUAGES, SUPPORTED_QUALITY_TIERS, STYLE_PRESETS, type Language, type QualityTier } from "@/lib/api";
 
 interface LanguageStylePickerProps {
   onBack: () => void;
-  onGenerate: (language: Language, styleId: string) => void;
+  onGenerate: (language: Language, styleId: string, qualityTier: QualityTier) => void;
   submitting: boolean;
   submitLabel?: string;
 }
+
+// Short, plain-language hint per tier - "High/Normal/Low" alone doesn't
+// tell a user what they're actually trading off (which provider, whether
+// it can run out for the day) - see src/notesGenerator.js's
+// buildProvidersForTier for the real mapping/cascade rules this describes.
+const QUALITY_TIER_HINTS: Record<QualityTier, string> = {
+  High: "Best quality (Gemini Flash). Limited daily uses - fails clearly instead of downgrading silently if unavailable.",
+  Normal: "Balanced quality and availability. Falls back automatically if the first provider is busy.",
+  Low: "Fastest/most available, lighter model. Good for quick drafts.",
+};
 
 /**
  * Sits between video selection (single-video input or the multi-link
@@ -21,6 +31,7 @@ interface LanguageStylePickerProps {
 export default function LanguageStylePicker({ onBack, onGenerate, submitting, submitLabel = "Generate Notes" }: LanguageStylePickerProps) {
   const [language, setLanguage] = useState<Language>("English");
   const [styleId, setStyleId] = useState<string>(STYLE_PRESETS[0].id);
+  const [qualityTier, setQualityTier] = useState<QualityTier>("Normal");
 
   return (
     <div>
@@ -67,10 +78,31 @@ export default function LanguageStylePicker({ onBack, onGenerate, submitting, su
         </div>
       </div>
 
+      <div className={styles.field}>
+        <label className={styles.label}>Note quality</label>
+        <div className={styles.actions} style={{ marginTop: 0 }}>
+          {SUPPORTED_QUALITY_TIERS.map((tier) => (
+            <button
+              key={tier}
+              type="button"
+              className={`${styles.button} ${qualityTier === tier ? styles.buttonPrimary : styles.buttonGhost}`}
+              onClick={() => setQualityTier(tier)}
+              disabled={submitting}
+              aria-pressed={qualityTier === tier}
+            >
+              {tier}
+            </button>
+          ))}
+        </div>
+        <p className={styles.hint} style={{ marginTop: 8 }}>
+          {QUALITY_TIER_HINTS[qualityTier]}
+        </p>
+      </div>
+
       <button
         type="button"
         className={`${styles.button} ${styles.buttonPrimary}`}
-        onClick={() => onGenerate(language, styleId)}
+        onClick={() => onGenerate(language, styleId, qualityTier)}
         disabled={submitting}
       >
         {submitting ? submitLabel : "Generate Notes"}

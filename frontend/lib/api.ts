@@ -46,6 +46,13 @@ export interface StatusResponse {
   transcriptLength?: number;
   notesTitle?: string;
   pageCount?: number;
+  // Quality tier picker (see src/notesGenerator.js's buildProvidersForTier)
+  // - which provider actually produced the notes, and whether it wasn't
+  // the tier's first-choice provider (only possible for "Normal", the only
+  // tier with more than one step - see the "done" view, which shows this
+  // only when providerCascaded is true rather than always).
+  notesProvider?: string;
+  providerCascaded?: boolean;
   // "Multiple videos" flow only (see src/pipeline.js's batch path) - a
   // human-readable per-video status ("Fetching video 2 of 4...") during
   // extracting_transcript, and any videos that failed and were skipped
@@ -187,16 +194,25 @@ export const STYLE_PRESETS: StylePreset[] = [
   { id: "minimal", label: "Minimal" },
 ];
 
-/** Both optional - omitted entirely (not even sent as empty strings) falls back to English/classic server-side, see server.js and template.js. */
+// Keep in sync with src/notesGenerator.js's buildProvidersForTier - High
+// maps to gemini-2.5-flash only (no cascade), Normal (default) starts at
+// Groq and cascades to Flash-Lite, Low is Flash-Lite only. "Normal" is the
+// omitted/default case, same pattern as English/classic above.
+export const SUPPORTED_QUALITY_TIERS = ["High", "Normal", "Low"] as const;
+export type QualityTier = (typeof SUPPORTED_QUALITY_TIERS)[number];
+
+/** All optional - omitted entirely (not even sent as empty strings) falls back to English/classic/Normal server-side, see server.js and template.js/notesGenerator.js. */
 export interface LanguageStyleOptions {
   language?: string;
   styleId?: string;
+  qualityTier?: string;
 }
 
-function languageStyleFields({ language, styleId }: LanguageStyleOptions = {}) {
+function languageStyleFields({ language, styleId, qualityTier }: LanguageStyleOptions = {}) {
   return {
     ...(language && language !== "English" ? { language } : {}),
     ...(styleId && styleId !== "classic" ? { styleId } : {}),
+    ...(qualityTier && qualityTier !== "Normal" ? { qualityTier } : {}),
   };
 }
 

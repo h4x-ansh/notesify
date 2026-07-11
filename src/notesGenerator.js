@@ -167,7 +167,7 @@ async function generateWithGemini(transcript, title, modelName, language, { thor
 // TPM Limit 12000" rejection that omitting the parameter entirely doesn't
 // hit. The actual fix for terse output is prompt wording (see
 // THOROUGHNESS_INSTRUCTIONS' quantified guidance), not a token cap.
-async function generateWithGroq(transcript, title, language) {
+async function generateWithGroq(transcript, title, language, { thorough = false } = {}) {
   if (!process.env.GROQ_API_KEY) {
     throw new Error("GROQ_API_KEY is not set - cannot use Groq as a fallback provider.");
   }
@@ -176,7 +176,10 @@ async function generateWithGroq(transcript, title, language) {
   const completion = await groq.chat.completions.create({
     model: "llama-3.3-70b-versatile",
     messages: [
-      { role: "system", content: `${SYSTEM_PROMPT}\n${THOROUGHNESS_INSTRUCTIONS}\n\n${JSON_SHAPE_INSTRUCTIONS}` },
+      {
+        role: "system",
+        content: `${SYSTEM_PROMPT}${thorough ? `\n${THOROUGHNESS_INSTRUCTIONS}` : ""}\n\n${JSON_SHAPE_INSTRUCTIONS}`,
+      },
       { role: "user", content: buildUserPrompt(transcript, title, language) },
     ],
     response_format: { type: "json_object" },
@@ -187,32 +190,86 @@ async function generateWithGroq(transcript, title, language) {
   return parseAndValidate(raw, "groq-llama-3.3-70b");
 }
 
+// The note-quality tier picker (see the frontend's picker screen) - each
+// tier maps to its own provider list, not a shared cascade. This is a
+// deliberate change from the single three-step cascade that used to apply
+// unconditionally: a user who explicitly picked "High" chose to wait for
+// (or be told no about) gemini-2.5-flash specifically, and silently
+// downgrading them to Groq/Flash-Lite would defeat the entire point of
+// having picked it - so High never cascades. Symmetrically, "Normal"
+// cascading all the way *up* into High would let a Normal-tier request
+// quietly consume gemini-2.5-flash's much scarcer daily quota, which is
+// exactly what tiering is meant to prevent. Each tier is its own closed
+// world:
+//
+// - **High** -> gemini-2.5-flash only (`GEMINI_MODEL` overridable), no
+//   thoroughness framing (doesn't need it), no cascade at all.
+// - **Normal** (default) -> groq-llama-3.3-70b first, cascading to
+//   gemini-3.1-flash-lite if Groq fails - the same two-step order this
+//   file used as its universal fallback chain before tiering existed, now
+//   scoped to just this tier. Both steps get THOROUGHNESS_INSTRUCTIONS.
+// - **Low** -> gemini-3.1-flash-lite only, thoroughness framing still
+//   applied (it's the same lightweight model regardless of which tier
+//   routes to it), no further cascade - it's already the cheapest/last-
+//   resort model, there's nowhere lower to fall to.
+//
+// Thoroughness is decided per tier, not by hardcoding it to a specific
+// model's identity - notice gemini-3.1-flash-lite gets `thorough: true`
+// in both the Normal and Low tiers below (the same reasoning applies
+// regardless of which tier routed to it), while gemini-2.5-flash never
+// does. If a future tier remix pointed a different model at a given tier,
+// its thoroughness would follow from that assignment, not from a
+// hardcoded model-name check.
+function buildProvidersForTier(tier, transcript, title, language) {
+  const geminiPrimary = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+  switch (tier) {
+    case "High":
+      return [{ label: geminiPrimary, run: () => generateWithGemini(transcript, title, geminiPrimary, language, { thorough: false }) }];
+    case "Low":
+      return [
+        {
+          label: "gemini-3.1-flash-lite",
+          run: () => generateWithGemini(transcript, title, "gemini-3.1-flash-lite", language, { thorough: true }),
+        },
+      ];
+    case "Normal":
+    default:
+      return [
+        { label: "groq-llama-3.3-70b", run: () => generateWithGroq(transcript, title, language, { thorough: true }) },
+        {
+          label: "gemini-3.1-flash-lite",
+          run: () => generateWithGemini(transcript, title, "gemini-3.1-flash-lite", language, { thorough: true }),
+        },
+      ];
+  }
+}
+
+// Shown when a tier's entire provider list is exhausted (its one provider
+// failed for High/Low, or both steps failed for Normal) - specific enough
+// that a user knows exactly what to do next, rather than a generic "try
+// again later" that doesn't tell them switching tiers would actually help
+// right now.
+function tierExhaustedMessage(tier) {
+  switch (tier) {
+    case "High":
+      return "High quality is unavailable right now (daily limit reached). Try Normal or Low, or wait until tomorrow.";
+    case "Low":
+      return "Low quality is unavailable right now. Try Normal or High, or wait until tomorrow.";
+    case "Normal":
+    default:
+      return "Normal quality is unavailable right now (daily limit reached on both providers). Try High or Low, or wait until tomorrow.";
+  }
+}
+
 /**
- * Gemini's free tier caps out fast (gemini-2.5-flash: ~20 requests/day),
- * so a single busy day of testing/use exhausts it - already happened
- * repeatedly during this project's own hosted testing (see the README's
- * Gemini quota note). Priority order, each step only reached if the
- * previous one hit a quota error specifically:
- *
- * 1. gemini-2.5-flash - best quality, current primary.
- * 2. groq-llama-3.3-70b - tried *before* Flash-Lite: Llama 3.3 70B is a
- *    substantially larger/more capable model than a "Lite" tier Gemini, so
- *    it's the better fallback quality-wise despite being a genuinely
- *    separate provider/account (GROQ_API_KEY, ~14,400 RPD free-tier
- *    headroom) with no native JSON-schema constraining on its side - leans
- *    on JSON_SHAPE_INSTRUCTIONS in the prompt plus the same zod validation
- *    every provider's output goes through either way. Gets
- *    THOROUGHNESS_INSTRUCTIONS appended (see above) - Llama tends to
- *    under-elaborate relative to full Gemini Flash on the same base prompt.
- * 3. gemini-3.1-flash-lite - the final safety net, not the first fallback:
- *    same Google account/API key as step 1, a separate quota bucket, same
- *    native responseSchema support - a same-family swap, not a different
- *    integration. (Was gemini-2.5-flash-lite; Google returned a 404 "no
- *    longer available to new users" for that model string as of July
- *    2026 - gemini-3.1-flash-lite is the current stable lightweight model
- *    per ai.google.dev/gemini-api/docs/models.) Also gets
- *    THOROUGHNESS_INSTRUCTIONS - a "Lite" tier model is the most prone of
- *    the three to sparse summarization on the bare prompt.
+ * `qualityTier` selects which provider list applies (see
+ * buildProvidersForTier above) - "Normal" when omitted/unrecognized, the
+ * same default the picker screen itself defaults to. Whichever provider
+ * in the selected tier's list actually produces the notes is returned
+ * alongside them as `providerUsed`, with `cascaded: true` when it wasn't
+ * the tier's first choice (only possible for Normal, the only tier with
+ * more than one step) - see pipeline.js, which surfaces this in job
+ * metadata for the "done" screen.
  *
  * `segments` (optional - see transcript.js/pipeline.js) never reaches any
  * provider's prompt - it's applied once, after whichever provider's output
@@ -221,18 +278,9 @@ async function generateWithGroq(transcript, title, language) {
  * it's a pure post-processing step over the final notes, independent of
  * which provider produced them or how many fallback attempts it took.
  */
-export async function generateNotes(transcript, { title, language, segments } = {}) {
-  const providers = [
-    {
-      label: process.env.GEMINI_MODEL || "gemini-2.5-flash",
-      run: () => generateWithGemini(transcript, title, process.env.GEMINI_MODEL || "gemini-2.5-flash", language),
-    },
-    { label: "groq-llama-3.3-70b", run: () => generateWithGroq(transcript, title, language) },
-    {
-      label: "gemini-3.1-flash-lite",
-      run: () => generateWithGemini(transcript, title, "gemini-3.1-flash-lite", language, { thorough: true }),
-    },
-  ];
+export async function generateNotes(transcript, { title, language, segments, qualityTier } = {}) {
+  const tier = qualityTier === "High" || qualityTier === "Low" ? qualityTier : "Normal";
+  const providers = buildProvidersForTier(tier, transcript, title, language);
 
   for (let i = 0; i < providers.length; i++) {
     const provider = providers[i];
@@ -241,7 +289,7 @@ export async function generateNotes(transcript, { title, language, segments } = 
       if (i > 0) {
         console.log(`[notesGenerator] generated via fallback provider: ${provider.label}`);
       }
-      return attachTimestamps(notes, segments);
+      return { notes: attachTimestamps(notes, segments), providerUsed: provider.label, cascaded: i > 0 };
     } catch (err) {
       const isLast = i === providers.length - 1;
       if (!isFallThroughError(err)) {
@@ -255,7 +303,7 @@ export async function generateNotes(transcript, { title, language, segments } = 
         err.message
       );
       if (isLast) {
-        throw new Error("All note-generation providers are currently rate-limited or unavailable. Try again later.");
+        throw new Error(tierExhaustedMessage(tier));
       }
     }
   }

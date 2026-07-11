@@ -18,6 +18,7 @@ import {
   type Language,
   type PlaylistPlan,
   type PlaylistResolution,
+  type QualityTier,
   type Stage,
   type StatusResponse,
 } from "@/lib/api";
@@ -74,6 +75,7 @@ type View =
       payload: BatchPayload;
       language: Language;
       styleId: string;
+      qualityTier: QualityTier;
       plan: PlaylistPlan;
       // Raw per-chunk video URLs from the /playlist/resolve call that
       // produced `plan` - kept around so confirming doesn't need to
@@ -456,20 +458,20 @@ export default function NotesApp() {
   // whether the confirm-chunks screen is needed, same trigger (more than
   // one chunk) as before, just decided client-side now instead of via
   // /generate's 409.
-  async function handleGenerate(source: PendingSource, language: Language, styleId: string) {
+  async function handleGenerate(source: PendingSource, language: Language, styleId: string, qualityTier: QualityTier) {
     setSubmitting(true);
     try {
       if (source.type === "single") {
         setSubmitStatusLabel("Fetching transcript...");
         const clientTranscript = await fetchTranscriptClientSide(source.url);
         setSubmitStatusLabel("Starting...");
-        const { jobId } = await generateNotes(source.url, clientTranscript, { language, styleId });
+        const { jobId } = await generateNotes(source.url, clientTranscript, { language, styleId, qualityTier });
         pollFailuresRef.current = 0;
         setView({ kind: "progress", jobId, status: { stage: "queued", progress: 0, error: null }, reconnecting: false });
       } else if ("videoUrls" in source.payload) {
         const transcripts = await prefetchTranscripts(source.payload.videoUrls, setSubmitStatusLabel);
         setSubmitStatusLabel("Starting...");
-        const result = await generateNotesBatch(source.payload, { language, styleId, transcripts });
+        const result = await generateNotesBatch(source.payload, { language, styleId, qualityTier, transcripts });
         applyGenerateResult(result);
       } else {
         setSubmitStatusLabel("Looking up playlist...");
@@ -480,6 +482,7 @@ export default function NotesApp() {
             payload: source.payload,
             language,
             styleId,
+            qualityTier,
             plan: {
               totalVideos: resolution.totalVideos,
               chunkSize: resolution.chunkSize,
@@ -492,7 +495,7 @@ export default function NotesApp() {
           const urls = resolution.chunks[0]?.urls ?? [];
           const transcripts = await prefetchTranscripts(urls, setSubmitStatusLabel);
           setSubmitStatusLabel("Starting...");
-          const result = await generateNotesBatch(source.payload, { language, styleId, transcripts });
+          const result = await generateNotesBatch(source.payload, { language, styleId, qualityTier, transcripts });
           applyGenerateResult(result);
         }
       }
@@ -511,13 +514,19 @@ export default function NotesApp() {
   // fetched to build that plan - reused here rather than re-resolving, so
   // confirming doesn't cost another yt-dlp round trip just to find out which
   // videos to prefetch transcripts for.
-  async function handleConfirmChunking(payload: BatchPayload, language: Language, styleId: string, resolution: PlaylistResolution) {
+  async function handleConfirmChunking(
+    payload: BatchPayload,
+    language: Language,
+    styleId: string,
+    qualityTier: QualityTier,
+    resolution: PlaylistResolution
+  ) {
     setSubmitting(true);
     try {
       const allUrls = resolution.chunks.flatMap((c) => c.urls);
       const transcripts = await prefetchTranscripts(allUrls, setSubmitStatusLabel);
       setSubmitStatusLabel("Starting...");
-      const result = await generateNotesBatch(payload, { language, styleId, confirmChunking: true, transcripts });
+      const result = await generateNotesBatch(payload, { language, styleId, qualityTier, confirmChunking: true, transcripts });
       applyGenerateResult(result);
     } catch (err) {
       handleGenerateError(err);
@@ -626,7 +635,7 @@ export default function NotesApp() {
         {view.kind === "picker" && (
           <LanguageStylePicker
             onBack={() => setView(view.source.type === "single" ? { kind: "input" } : { kind: "multi-link" })}
-            onGenerate={(language, styleId) => handleGenerate(view.source, language, styleId)}
+            onGenerate={(language, styleId, qualityTier) => handleGenerate(view.source, language, styleId, qualityTier)}
             submitting={submitting}
             submitLabel={submitStatusLabel}
           />
@@ -651,7 +660,7 @@ export default function NotesApp() {
                 type="button"
                 className={`${styles.button} ${styles.buttonPrimary}`}
                 disabled={submitting}
-                onClick={() => handleConfirmChunking(view.payload, view.language, view.styleId, view.resolution)}
+                onClick={() => handleConfirmChunking(view.payload, view.language, view.styleId, view.qualityTier, view.resolution)}
               >
                 {submitting ? submitStatusLabel : `Confirm & generate ${view.plan.chunkCount} PDFs`}
               </button>
@@ -788,6 +797,17 @@ export default function NotesApp() {
               <p className={styles.subtitle} style={{ marginTop: 0 }}>
                 {view.status.pageCount} page(s) rendered.
               </p>
+            )}
+
+            {/* Only shown when the tier's own cascade actually kicked in
+                (see src/notesGenerator.js's buildProvidersForTier) - a
+                straightforward single-provider tier succeeding on its
+                first try (High, Low, or Normal without needing to fall
+                through to Flash-Lite) says nothing extra here. */}
+            {view.status.providerCascaded && view.status.notesProvider && (
+              <div className={styles.metaLog}>
+                <p className={styles.metaLine}>Generated via {view.status.notesProvider} (the first-choice provider was unavailable).</p>
+              </div>
             )}
 
             {view.status.skippedVideos && view.status.skippedVideos.length > 0 && (

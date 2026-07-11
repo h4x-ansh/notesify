@@ -236,6 +236,15 @@ const MAX_BATCH_VIDEOS = 25;
 const ALLOWED_LANGUAGES = ["English", "Hindi", "Tamil", "Bengali"];
 const ALLOWED_STYLE_IDS = Object.keys(STYLE_PRESETS);
 
+// Note-quality tier picker (same picker screen as language/style) - see
+// notesGenerator.js's buildProvidersForTier for what each tier actually
+// maps to and why each is a closed provider list rather than one shared
+// cascade. Optional; omitted/unrecognized defaults to "Normal" in
+// notesGenerator.js itself (not re-defaulted here) - this allowlist exists
+// purely to fail an unsupported value fast with a clear 400, same reasoning
+// as ALLOWED_LANGUAGES/ALLOWED_STYLE_IDS above.
+const ALLOWED_QUALITY_TIERS = ["High", "Normal", "Low"];
+
 // Per-video pre-fetched transcripts for the batch/playlist paths (see the
 // frontend's client-side transcript prefetch work) - the same IP-blocking
 // problem `transcript`/`transcriptSource` solve for a single video applies
@@ -328,6 +337,7 @@ app.post("/generate", requireApiSecret, generateLimiter, async (req, res) => {
     playlistUrl,
     language,
     styleId,
+    qualityTier,
     confirmChunking,
     transcripts,
   } = req.body ?? {};
@@ -388,6 +398,9 @@ app.post("/generate", requireApiSecret, generateLimiter, async (req, res) => {
   }
   if (styleId !== undefined && !ALLOWED_STYLE_IDS.includes(styleId)) {
     return res.status(400).json({ error: `styleId, if provided, must be one of: ${ALLOWED_STYLE_IDS.join(", ")}` });
+  }
+  if (qualityTier !== undefined && !ALLOWED_QUALITY_TIERS.includes(qualityTier)) {
+    return res.status(400).json({ error: `qualityTier, if provided, must be one of: ${ALLOWED_QUALITY_TIERS.join(", ")}` });
   }
   if (confirmChunking !== undefined && typeof confirmChunking !== "boolean") {
     return res.status(400).json({ error: "confirmChunking, if provided, must be a boolean" });
@@ -462,6 +475,7 @@ app.post("/generate", requireApiSecret, generateLimiter, async (req, res) => {
           videoUrls: chunk.urls,
           language,
           styleId,
+          qualityTier,
           preFetchedTranscripts: transcripts,
         }).catch((err) => {
           console.error(`[job ${job.id}] failed:`, err.message);
@@ -489,6 +503,7 @@ app.post("/generate", requireApiSecret, generateLimiter, async (req, res) => {
       playlistUrl,
       language,
       styleId,
+      qualityTier,
       preFetchedTranscripts: transcripts,
     }).catch((err) => {
       console.error(`[job ${job.id}] failed:`, err.message);
@@ -525,6 +540,7 @@ app.post("/generate", requireApiSecret, generateLimiter, async (req, res) => {
     preFetchedTranscript,
     language,
     styleId,
+    qualityTier,
   }).catch((err) => {
     // runPipeline already records { stage: "error", error } via onUpdate
     // before rethrowing - this catch just stops the rejection from

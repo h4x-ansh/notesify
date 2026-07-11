@@ -167,6 +167,15 @@ function summarizeSkipped(results) {
  * color preset, unset/unknown falls back to the original "classic" colors).
  * Both apply the same way regardless of single-video/batch/playlist source.
  *
+ * `qualityTier` (High/Normal/Low, same picker screen) selects which
+ * provider list generateNotes() uses - see notesGenerator.js's
+ * buildProvidersForTier for the actual mapping/cascade rules per tier.
+ * Unset/unrecognized defaults to Normal there, not here - this function
+ * just passes the raw value through. `notesProvider`/`providerCascaded`
+ * in the `generating_notes` update below surface which provider actually
+ * answered and whether the tier's own cascade kicked in, for the "done"
+ * screen to show when it's not the tier's straightforward single provider.
+ *
  * `preFetchedTranscripts` (plural, distinct from the single-video
  * `preFetchedTranscript` above) is the batch/playlist equivalent - a map of
  * video URL -> {text, source, segments} for whichever videos the client
@@ -198,6 +207,7 @@ export async function runPipeline(
     playlistUrl = null,
     language = null,
     styleId = null,
+    qualityTier = null,
   } = {}
 ) {
   try {
@@ -250,11 +260,20 @@ export async function runPipeline(
     });
 
     onUpdate({ stage: "generating_notes", progress: 35 });
-    const notes = await generateNotes(transcript, { language, segments });
+    const { notes, providerUsed, cascaded } = await generateNotes(transcript, { language, segments, qualityTier });
     onUpdate({
       stage: "generating_notes",
       progress: 65,
-      meta: { notesTitle: notes.title, pageCount: notes.pages.length },
+      meta: {
+        notesTitle: notes.title,
+        pageCount: notes.pages.length,
+        notesProvider: providerUsed,
+        // Only present when true - a straightforward single-provider tier
+        // (High, Low, or Normal succeeding on its first try) shouldn't
+        // carry a dead `providerCascaded: false` field in its status
+        // forever, same reasoning as `skippedVideos` above.
+        ...(cascaded ? { providerCascaded: true } : {}),
+      },
     });
 
     onUpdate({ stage: "rendering_pdf", progress: 75 });
