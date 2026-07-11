@@ -495,10 +495,15 @@ is hit:
 
 1. **`gemini-2.5-flash`** (`GEMINI_MODEL` overridable) - current primary,
    best quality.
-2. **`gemini-2.5-flash-lite`** - same `GEMINI_API_KEY`/Google account, but a
-   separate ~1,000 RPD quota bucket from `-flash`'s ~20 RPD, and the same
-   native `responseSchema` constraining - a same-family model-string swap,
-   not a different integration.
+2. **`gemini-3.1-flash-lite`** - same `GEMINI_API_KEY`/Google account, but a
+   separate quota bucket from `-flash`'s, and the same native
+   `responseSchema` constraining - a same-family model-string swap, not a
+   different integration. (Was `gemini-2.5-flash-lite` until Google started
+   returning a `404 "This model models/gemini-2.5-flash-lite is no longer
+   available to new users"` for it - see "Stale model string" below.
+   `gemini-3.1-flash-lite` is the current stable lightweight model per
+   [ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models),
+   confirmed generally available, not preview.)
 3. **Groq's `llama-3.3-70b-versatile`** (`GROQ_API_KEY`, free at
    [console.groq.com/keys](https://console.groq.com/keys)) - a genuinely
    separate provider/account, ~14,400 RPD free-tier headroom. Different
@@ -509,13 +514,34 @@ is hit:
    (`NotesSchema`) validation every provider's output goes through either
    way is still the real gate, not the prompt wording.
 
-**Only advances on a quota error, specifically** - `isQuotaError()` checks
-for a `429` status, `groq-sdk`'s typed `RateLimitError`, or
-quota/rate-limit wording in the error message. Anything else (malformed
-transcript, a provider's JSON failing the zod schema, a genuine 5xx, auth
-errors) fails immediately instead of silently masking a real problem behind
-more (doomed) attempts - a different provider wouldn't fix a schema
-mismatch or a bad API key either.
+**Advances on a quota error, or a 404 "model no longer available" error** -
+`isFallThroughError()` (was `isQuotaError()` - renamed when the second
+trigger was added) checks for a `429` status, `groq-sdk`'s typed
+`RateLimitError`, quota/rate-limit wording in the error message, or a `404`
+whose message actually says the model is unavailable/deprecated/not found
+(not just any 404 - see "Stale model string" below for why this second
+trigger exists). Anything else (malformed transcript, a provider's JSON
+failing the zod schema, a genuine unrelated 5xx, auth errors) fails
+immediately instead of silently masking a real problem behind more (doomed)
+attempts - a different provider wouldn't fix a schema mismatch or a bad API
+key either.
+
+**Stale model string, fixed (July 2026)**: `gemini-2.5-flash-lite` started
+returning a `404` ("no longer available to new users") from Google's API -
+confirmed via a real call, and via Google's own AI Developers Forum
+reporting the same thing happening broadly the same week, ahead of the
+model's officially published October 2026 deprecation date. Two problems,
+both fixed:
+1. **The model string itself** - step 2 now uses `gemini-3.1-flash-lite`
+   (see above), the current stable lightweight model.
+2. **The fallback chain didn't advance on this failure at all** - a 404 for
+   an unavailable model isn't a quota error, so the old `isQuotaError()`
+   didn't match it, and the chain surfaced it as a hard failure instead of
+   trying Groq - defeating the entire point of having a fallback chain for
+   exactly the kind of failure (a fixable-by-trying-something-else error)
+   it exists for. `isFallThroughError()` now also matches this case (see
+   above), reasoning identically to why quota errors advance: retrying the
+   same provider/model would never succeed either way.
 
 **Which provider actually answered is always logged** - `console.log`
 on any fallback, so a job that succeeded via Groq is never silently
@@ -527,12 +553,12 @@ rate-limited. Try again later."` - not the old generic per-provider 429
 message, and not conflated with the "no captions" family of errors from
 the transcript stage.
 
-**Verified without burning real quota or needing a real `GROQ_API_KEY`**:
-monkeypatched `fetch` to return actual-shaped 429 responses from Gemini's
-API and a mocked (but response-shape-accurate) success from Groq's
-OpenAI-compatible endpoint, run through the real `generateNotes()` - not a
-reimplementation of the logic under test. Confirmed, each as a distinct
-scenario:
+**Originally verified without burning real quota or needing a real
+`GROQ_API_KEY`**: monkeypatched `fetch` to return actual-shaped 429
+responses from Gemini's API and a mocked (but response-shape-accurate)
+success from Groq's OpenAI-compatible endpoint, run through the real
+`generateNotes()` - not a reimplementation of the logic under test.
+Confirmed, each as a distinct scenario:
 - Real `gemini-2.5-flash` call against a real transcript still produces
   valid, schema-passing notes (the actual point of "don't break the
   common case" - checked first, before any fallback-path testing).
@@ -545,18 +571,30 @@ scenario:
   inferred from the outcome).
 - A schema-shape mismatch (valid HTTP 200, but the model's JSON is missing
   required fields) on the primary provider → also fails immediately, not
-  treated as a quota problem - confirms `isQuotaError()` doesn't
+  treated as a quota problem - confirms the fall-through check (then still
+  named `isQuotaError()`, before this fix renamed and broadened it) didn't
   over-match.
 
-**Not verified**: the real Groq API. No `GROQ_API_KEY` was available in
-this environment to test against - console.groq.com requires signing up
-for an account, which wasn't done here. The mocked test above matches
-Groq's documented OpenAI-compatible response shape closely, but hasn't
-been checked against what Llama 3.3 70B actually returns for a real
-transcript - specifically whether its JSON/LaTeX output needs prompt
-adjustments beyond what `JSON_SHAPE_INSTRUCTIONS` already spells out. Set
-a real `GROQ_API_KEY` and either force a fake Gemini 429 (as above) or
-wait for real quota exhaustion to see it in practice.
+**Re-verified against the real Groq API** as part of the stale-model-string
+fix above (`GROQ_API_KEY` is now configured, closing the earlier gap) -
+`fetch` monkeypatched only for the two Gemini calls, Groq's own call left
+completely real:
+- Forced a real-shaped `429` on `gemini-2.5-flash`, left
+  `gemini-3.1-flash-lite` untouched → real call to the new model string
+  succeeded with genuine, schema-passing notes - confirms the corrected
+  model string is actually valid against Google's live API right now, not
+  just per the docs.
+- Forced `429` on `gemini-2.5-flash` and a real-shaped `404 "no longer
+  available"` on `gemini-3.1-flash-lite` → chain correctly fell through
+  all the way to a **real, live Groq call** (confirmed via a request-seen
+  flag, not inferred), which returned genuine, schema-passing notes -
+  the exact scenario the fix targets, working end to end against real
+  providers.
+- A genuine, unrelated error (`500`, matching neither quota nor
+  model-unavailable wording) on the primary provider → still fails
+  immediately, Groq never called - confirms `isFallThroughError()`'s
+  broadened matching didn't loosen the "only fall through on a fixable-
+  by-switching-provider error" guarantee.
 
 ## Mobile app (Capacitor/Android)
 

@@ -79,18 +79,37 @@ function parseAndValidate(raw, providerLabel) {
 }
 
 /**
- * 429/quota-exceeded specifically - the one failure mode that should
- * advance to the next provider in the chain. Everything else (malformed
- * transcript, a provider's output failing zod validation, network errors,
- * auth errors) is a real problem that trying a different provider wouldn't
- * fix, so it should fail loudly and immediately rather than being masked
- * by silently falling through.
+ * 429/quota-exceeded, or a 404 "model not found/no longer available"
+ * response - the two failure modes where retrying the *same* provider (or
+ * even the same model string) would never succeed, so advancing to the
+ * next provider is the only thing that could actually help. Everything
+ * else (malformed transcript, a provider's output failing zod validation,
+ * network errors, auth errors) is a real problem that trying a different
+ * provider wouldn't fix either, so those still fail loudly and immediately
+ * instead of being masked by more (doomed) attempts.
+ *
+ * The 404 case isn't hypothetical - it's exactly what happened when
+ * gemini-2.5-flash-lite's model string went stale: Google started
+ * returning "This model models/gemini-2.5-flash-lite is no longer
+ * available to new users" as a 404 (`GoogleGenerativeAIFetchError.status`,
+ * set from the HTTP response status - see @google/generative-ai's fetch
+ * error class), and the chain didn't advance to Groq at all because only
+ * 429s counted as fall-through triggers - a failure a different provider
+ * would have trivially recovered from instead surfaced as a hard error.
+ * Scoped to messages that actually say the model is unavailable/deprecated/
+ * not found, not just any 404, so an unrelated 404 (a real bug in this
+ * codebase, a moved endpoint) still fails loudly rather than being masked.
  */
-function isQuotaError(err) {
+function isFallThroughError(err) {
   if (err?.status === 429) return true; // groq-sdk (and most HTTP client errors) set this
   if (err?.name === "RateLimitError") return true; // groq-sdk's typed error class
   const message = err?.message || String(err);
-  return /\b429\b|quota|rate.?limit|resource.?exhausted|too many requests/i.test(message);
+  if (/\b429\b|quota|rate.?limit|resource.?exhausted|too many requests/i.test(message)) return true;
+
+  if (err?.status === 404 || /\b404\b/.test(message)) {
+    return /model|no longer available|not found|deprecated/i.test(message);
+  }
+  return false;
 }
 
 async function generateWithGemini(transcript, title, modelName, language) {
@@ -136,9 +155,12 @@ async function generateWithGroq(transcript, title, language) {
  * previous one hit a quota error specifically:
  *
  * 1. gemini-2.5-flash - best quality, current primary.
- * 2. gemini-2.5-flash-lite - same Google account/API key, a separate
- *    ~1,000 RPD quota bucket, same native responseSchema support - a
- *    same-family swap, not a different integration.
+ * 2. gemini-3.1-flash-lite - same Google account/API key, a separate quota
+ *    bucket, same native responseSchema support - a same-family swap, not
+ *    a different integration. (Was gemini-2.5-flash-lite; Google returned
+ *    a 404 "no longer available to new users" for that model string as of
+ *    July 2026 - gemini-3.1-flash-lite is the current stable lightweight
+ *    model per ai.google.dev/gemini-api/docs/models.)
  * 3. groq-llama-3.3-70b - a genuinely separate provider/account
  *    (GROQ_API_KEY), ~14,400 RPD free-tier headroom. Different model
  *    family, no native JSON-schema constraining on Groq's side - leans on
@@ -151,7 +173,7 @@ export async function generateNotes(transcript, { title, language } = {}) {
       label: process.env.GEMINI_MODEL || "gemini-2.5-flash",
       run: () => generateWithGemini(transcript, title, process.env.GEMINI_MODEL || "gemini-2.5-flash", language),
     },
-    { label: "gemini-2.5-flash-lite", run: () => generateWithGemini(transcript, title, "gemini-2.5-flash-lite", language) },
+    { label: "gemini-3.1-flash-lite", run: () => generateWithGemini(transcript, title, "gemini-3.1-flash-lite", language) },
     { label: "groq-llama-3.3-70b", run: () => generateWithGroq(transcript, title, language) },
   ];
 
@@ -165,18 +187,18 @@ export async function generateNotes(transcript, { title, language } = {}) {
       return notes;
     } catch (err) {
       const isLast = i === providers.length - 1;
-      if (!isQuotaError(err)) {
-        // Not a quota problem - a different provider wouldn't fix it
-        // either, so surface it immediately instead of masking it behind
-        // more (doomed) attempts.
+      if (!isFallThroughError(err)) {
+        // Not a quota/model-unavailable problem - a different provider
+        // wouldn't fix it either, so surface it immediately instead of
+        // masking it behind more (doomed) attempts.
         throw err;
       }
       console.error(
-        `[notesGenerator] ${provider.label} hit a quota/rate-limit error${isLast ? "" : ", trying next provider"}:`,
+        `[notesGenerator] ${provider.label} hit a quota/rate-limit or model-unavailable error${isLast ? "" : ", trying next provider"}:`,
         err.message
       );
       if (isLast) {
-        throw new Error("All note-generation providers are currently rate-limited. Try again later.");
+        throw new Error("All note-generation providers are currently rate-limited or unavailable. Try again later.");
       }
     }
   }
