@@ -41,3 +41,7 @@ services:
         sync: false
       - key: JOBS_OUTPUT_DIR
         value: /app/output/jobs
+      # Per-IP rate limits (RATE_LIMIT_GENERATE_MAX etc. - see
+      # .env.example and server.js) all have sensible built-in defaults and
+      # are deliberately not listed here - only add them if real traffic
+      # shows the defaults are wrong for this deployment.

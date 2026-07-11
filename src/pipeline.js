@@ -4,6 +4,7 @@ import { getTranscript } from "./transcript.js";
 import { generateNotes } from "./notesGenerator.js";
 import { renderNotesHtml } from "./template.js";
 import { exportHtmlToPdf } from "./pdfExport.js";
+import { classifyError } from "./errors.js";
 
 /**
  * Runs transcript extraction -> Gemini notes generation -> template render
@@ -58,7 +59,16 @@ export async function runPipeline(youtubeUrl, outputPath, { onUpdate = () => {},
 
     return { transcript, transcriptSource: source, notes, html, outputPath, timings };
   } catch (err) {
-    onUpdate({ stage: "error", error: err.message });
+    // The raw error can carry a Gemini/Groq SDK message (internal URLs,
+    // quota metric names, model IDs) or a zod dump with schema paths -
+    // none of that should reach an HTTP client (see server.js's /generate,
+    // the only consumer of onUpdate's patches that's actually network-
+    // facing). Full detail is preserved server-side two ways: the rethrow
+    // below is untouched (the CLI's own catch in generate-notes.js still
+    // sees the real message), and server.js's fire-and-forget .catch() on
+    // this call logs err.message from that same rethrow.
+    const { code, message } = classifyError(err);
+    onUpdate({ stage: "error", error: message, errorCode: code });
     throw err;
   }
 }

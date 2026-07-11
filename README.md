@@ -578,12 +578,12 @@ necessary for mobile.
 the server - this can take up to a minute," matching Render's actual
 spin-down behavior instead of implying something's broken.
 
-**Retry-on-`no-server`**: `fetchWithRetry` in `lib/api.ts` specifically
-retries the `404` + `x-render-routing: no-server` signature identified in
-the hosted-API investigation above, applied to `/generate`, `/status`, and
-`/download`. A real "job not found" 404 is effectively never hit in normal
-use (jobId always comes from a prior successful `/generate`), so this
-doesn't mask genuine errors.
+**Retry-on-`no-server`**: `fetchWithRetry` in `lib/api.ts` retries transient
+failures on `/generate`, `/status`, and `/download` - see the
+[Retry-logic audit](#retry-logic-audit) section below for what this
+actually catches in practice (not quite what it was originally built to
+detect - the no-server signature turned out to be unobservable from a real
+browser) and how `/generate` specifically is made safe to retry.
 
 **What's actually been verified, and what hasn't:**
 - ✅ `npx cap add android` / `npx cap sync` ran cleanly and the built static
@@ -758,3 +758,215 @@ state) instead of doing nothing. Same standing limitation as the rest of
 the mobile work - no Android SDK/emulator/device here. This needs a real
 device install: build the APK, tap Download on a completed job, and
 confirm it's the share sheet or a visible message, never silence.
+
+## Retry-logic audit
+
+Audited every client-side call to the hosted Render backend
+(`frontend/lib/api.ts`) for `fetchWithRetry` coverage, since it had only
+ever been explicitly verified against `/status` polling. What this found
+was more interesting than "some endpoint was missing retry."
+
+**The headline finding: the retry logic's own detection mechanism was dead
+code.** `fetchWithRetry` used to specifically look for a `404` response
+carrying an `x-render-routing: no-server` header - the exact signature
+identified in the original hosted-API investigation - and only retry that.
+Testing it properly (simulating the actual failure through a real browser,
+not just grepping for `fetch(`) surfaced the problem: Render's real
+no-server response carries **no `Access-Control-Allow-Origin` header at
+all** (re-checked the raw response captured during the original
+investigation to confirm - it isn't there). A cross-origin `fetch()` to a
+response with no CORS header doesn't deliver a readable `Response` to JS -
+it throws an opaque network error before `res.status`/`res.headers` can
+ever be inspected. The specific detection branch could never fire in a
+real browser; every prior "confirmed working" claim about it came from
+curl-based testing, which isn't subject to browser CORS at all and so
+never would have caught this.
+
+In practice this meant the no-server case *was* still being caught, just
+by accident, via the generic network-error catch-all that also exists in
+`fetchWithRetry` - not the mechanism actually built and documented for it.
+
+**This mattered immediately, not just as a cleanup item**, because fixing
+a different gap this same audit found had just made it visibly break:
+`POST /generate` wasn't using `fetchWithRetry` at all before this audit -
+a straightforward gap, easy to fix by wrapping it the same way `/status`
+already was. But blindly retrying `/generate` on *any* network error is
+unsafe on its own merits: a dropped connection doesn't prove the request
+never reached Express, so a retry risks silently creating a second job
+(a second Gemini call, a second transcript fetch, doubled cost, for what
+looked like one click). The obvious-looking fix - "only retry the
+provably-safe no-server case, not generic network errors, for `/generate`
+specifically" - is exactly what got implemented first. Verifying it (per
+this task's explicit "simulate the actual failure, don't just trust it")
+is what surfaced the dead-code problem: since the no-server case can't
+actually be detected client-side, "only retry the provably-safe case"
+collapsed to "never retry `/generate` at all" - worse than doing nothing,
+since it would silently stop recovering from the single most common real
+failure (a cold-start blip on the very first request) for the one endpoint
+where failing to recover means the user's click just didn't do anything.
+
+**The actual fix: make the retry itself safe, not the detection.**
+`POST /generate` now sends a client-generated `requestId`
+(`crypto.randomUUID()`, created once per submit attempt and reused
+unchanged across that attempt's retries - see `generateNotes` in
+`lib/api.ts`). `server.js` keeps a short-lived in-memory cache
+(`requestId -> jobId`, 5 minute TTL) and returns the existing job on a
+repeated `requestId` instead of creating a new one. This makes blind
+retry-on-any-network-error provably safe for `/generate` too, the same way
+it always was for the read-only `GET` endpoints - so `fetchWithRetry`
+itself simplified back down to "retry on any thrown fetch error," with the
+no-server-specific branch removed rather than left in as misleading dead
+code.
+
+**Per-endpoint conclusion:**
+- **`POST /generate`** - gap confirmed and fixed: now uses `fetchWithRetry`,
+  made safe via the `requestId` idempotency cache above.
+- **`GET /status/:jobId`** - already covered (the original target), still
+  correctly wired after the fallback-chain and BYOK-adjacent changes since.
+  Read-only, so blind retry was always safe here regardless of the
+  no-server-detection question.
+- **`GET /download/:jobId`** - already covered from the Capacitor download
+  work, also read-only, also always safe.
+- **`GET /health`** - deliberately *not* wrapped in `fetchWithRetry`, and
+  this is correct as-is, not an oversight: `checkHealth()` is already
+  called from its own external polling loop in `NotesApp.tsx` (retrying
+  every `HEALTH_RETRY_MS` indefinitely), so stacking `fetchWithRetry`'s
+  internal backoff on top would only make each individual poll slower
+  without changing the eventual outcome.
+
+**Verified, each as a real scenario through the actual running app, not
+inferred:**
+- Real backend, real idempotency cache, a genuine `req.abort()` (not a
+  mocked response) on the first `/generate` attempt: client made 2 attempts,
+  server-side truth (`GET /debug/jobs`) showed **exactly one job created**,
+  not two.
+- Same real-backend setup with a genuine network abort on the first
+  `/status` and first `/download` attempt each, run through a full real
+  Gemini call end to end: both recovered, `/status` via its own polling
+  loop naturally continuing, `/download` via `fetchWithRetry`'s own retry,
+  ending in a real downloadable blob link.
+- The dead-code claim itself verified by reproducing the *exact* no-server
+  response shape (status, headers, missing ACAO) through Puppeteer and
+  confirming `fetch()` throws rather than resolving - not inferred from
+  reading MDN, checked against this specific response.
+
+## Security review
+
+A pass across `server.js` and the hosted API, covering rate limiting, input
+validation, secrets, dependencies, and error handling.
+
+**Rate limiting** (`express-rate-limit`, per-IP, tiered by cost): there's no
+login/signup here - `API_SHARED_SECRET` is one shared credential, not user
+accounts - so this isn't brute-force login protection, it's specifically
+about bounding how much of the shared Gemini/Groq daily quota one IP can
+burn through `/generate`, the only endpoint that costs anything per call.
+
+| Endpoint | Default | Env var overrides |
+|---|---|---|
+| `POST /generate` | 5 / 15 min | `RATE_LIMIT_GENERATE_MAX`, `RATE_LIMIT_GENERATE_WINDOW_MS` |
+| `GET /status/:jobId` | 60 / min | `RATE_LIMIT_STATUS_MAX`, `RATE_LIMIT_STATUS_WINDOW_MS` |
+| `GET /download/:jobId` | 20 / 15 min | `RATE_LIMIT_DOWNLOAD_MAX`, `RATE_LIMIT_DOWNLOAD_WINDOW_MS` |
+
+`app.set("trust proxy", 1)` was required for this to work correctly at all
+on Render - without it, every request looks like it comes from Render's own
+reverse proxy, collapsing per-IP limiting into one shared bucket for every
+real caller. Verified each tier is an independent bucket (exhausting
+`/generate`'s limit doesn't touch `/status`'s), that the threshold is
+actually driven by the env var (not just the hardcoded default happening to
+match), and that the response carries standard `RateLimit-*`/`Retry-After`
+headers - by running a real server with a deliberately low limit and
+watching the 4th of 3 allowed requests get a clean `429`.
+
+**Input validation on `POST /generate`**: `youtubeUrl` is checked against
+an anchored pattern (not just "is a string") plus a length cap;
+`transcript` (when a client sends one pre-fetched - see the client-side
+transcript-fetch work) is capped at 2,000,000 characters and rejected if
+empty/wrong-type; `transcriptSource` is checked against an allowlist of the
+only three values anything in this codebase actually sends
+(`captions`, `captions-client`, `client`) rather than accepted as an
+arbitrary string. Found and fixed a real latent bug in the process: Express's
+default JSON body limit is 100kb, well under real transcript sizes seen in
+this project's own testing (~1.4MB for one long lecture) - raised to 5mb.
+Verified with real malformed requests, not just written and assumed
+correct: a non-YouTube URL, a missing URL, an XSS-shaped string appended to
+an otherwise-valid URL, an invalid `transcriptSource`, an empty transcript,
+and a wrong-typed transcript all get a clean `400` with a specific message
+- and, to make sure the validation isn't just rejecting everything, a URL
+with a real trailing query param (`&t=30s`) and a `youtu.be` short-link
+were both confirmed still accepted.
+
+**Secrets**: grepped the full git history (`git log --all -p`, not just
+current files) for Google/OpenAI/Groq API key patterns and the actual
+`API_SHARED_SECRET` value used during this project's own testing - no
+hits. Confirmed `.env` and `frontend/.env.mobile` were never committed at
+any point (`git log --all --full-history`). Re-checked the mobile secret
+leak specifically, since the Android build's `android/` directory is
+intentionally committed (Capacitor's own recommendation, see the mobile
+section above): confirmed the *built* web assets
+(`android/app/src/main/assets/public/`, where the baked-in
+`NEXT_PUBLIC_API_SHARED_SECRET` would actually live) are excluded by
+Capacitor's own generated `.gitignore`, not something this project had to
+configure - the secret genuinely never reaches a commit. The APK itself
+still contains it once built locally, same accepted single-owner-app
+tradeoff documented in the mobile section - unchanged by this review.
+
+**Dependencies**: `npm audit` clean (0 vulnerabilities) in the root
+project. `frontend/` had one moderate vulnerability - `postcss` (XSS via
+unescaped `</style>` in CSS stringification), pulled in transitively by
+Next.js, patched via `npm audit fix --force`. That fix would have
+downgraded Next.js from 16.2.10 to 9.3.3 - a four-major-version regression,
+not something to do for a moderate transitive issue. Used an `overrides`
+entry in `frontend/package.json` instead to pin `postcss` directly to a
+patched version without touching Next.js at all - confirmed the frontend
+still builds clean afterward.
+
+**Error handling**: this was the one that turned into more than a
+checklist item. `job.error` (surfaced via `/status`, and previously the
+route's own final error handler) used to carry whatever the failing
+provider's SDK said verbatim - real Gemini 429 bodies include the request
+URL, quota metric names, and model IDs; a zod validation failure dumps
+schema paths. `src/errors.js` (`classifyError`) now maps any pipeline error
+to one of a handful of stable codes (`rate_limited`, `transcript_unavailable`,
+`invalid_output`, `invalid_url`, `internal_error`) plus a generic message -
+applied in `pipeline.js`'s catch block before the sanitized version ever
+reaches the job store, while the *original* error is still what gets
+rethrown (so the CLI's own `catch` in `generate-notes.js`, and
+`server.js`'s own `console.error` on the pipeline's background promise,
+both still see full detail - nothing was lost, it just stopped being sent
+over HTTP). The route-level catch-all error handler was doing the same
+leak on a different path (`err.message` straight into the 500 response,
+for whatever Express itself needed to handle, e.g. malformed JSON) - now
+always a fixed generic message, full error still logged server-side.
+
+Verified with a real, not hypothetical, forced failure: monkeypatched
+`fetch` to return the *actual* Gemini 429 response shape (with the real
+quota-exceeded message, URLs and all) and a Groq 429 to exhaust the whole
+fallback chain, then drove the real `server.js` through a real
+`/generate` → poll `/status` cycle. Server console showed the complete raw
+chain (both Gemini models' full error text, Groq's error, each fallback
+step) exactly as intended for server-side debugging. The actual `/status`
+HTTP response the client received contained only
+`"The note-generation service is rate-limited right now. Please try again
+in a few minutes."` and `"errorCode": "rate_limited"` - checked
+programmatically against five distinct leak patterns (the Google API URL,
+any Groq mention, quota-internals wording, a stack-trace shape, a
+filesystem-path shape) and confirmed none were present, rather than just
+eyeballing the response.
+
+**Found along the way, not originally in scope but fixed anyway**:
+`/debug/jobs` and `/debug/jobs/:jobId` had no auth at all - flagged as a
+known gap back when `API_SHARED_SECRET` was first added, never actually
+closed until this pass. They return full job objects (the video URL,
+transcript length/source, notes title, timing data) and were reachable by
+anyone with the hosted URL, no secret required. Now gated by the same
+`requireApiSecret` as every other route - a no-op locally/in Electron where
+the secret is unset, same as everywhere else.
+
+**Explicitly out of scope, per the task**: file upload review - this app
+has no file upload surface; input is always a YouTube URL or transcript
+text, never a user-uploaded file.
+
+Full end-to-end regression re-run after all of the above, with default
+(unmodified) production rate limits: a real video, real captions, real
+Gemini call, real PDF render, reaching `done` in ~12s with `errorCode: null`
+on the success path - confirming none of this broke the actual pipeline.

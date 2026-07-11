@@ -35,6 +35,13 @@ export interface StatusResponse {
   stage: Stage;
   progress: number;
   error: string | null;
+  // Stable machine-readable classification of `error` (e.g. "rate_limited")
+  // - added alongside a server-side security pass that stopped forwarding
+  // raw Gemini/Groq error text to the client (see src/errors.js). Not yet
+  // consumed here; isRateLimitError's message-regex approach still works
+  // since the sanitized message still contains words like "rate-limited",
+  // but this is the more robust signal to switch to.
+  errorCode?: string | null;
   transcriptSource?: string;
   transcriptLength?: number;
   notesTitle?: string;
@@ -61,25 +68,36 @@ async function parseErrorBody(res: Response): Promise<string> {
 }
 
 /**
- * Render's free tier occasionally answers a perfectly healthy app with a
- * bare `404` carrying `x-render-routing: no-server` from its own edge
- * proxy, not from Express (confirmed empirically - see README, "Cold-start
- * / spin-down behavior actually observed"). Retrying that specific case a
- * couple of times clears it in practice. A real "job not found" 404 from
- * our own Express app is effectively never hit here since every jobId this
- * app requests comes from a prior successful /generate response - so it's
- * safe to retry on this signature without masking a genuine 404.
+ * Render's free tier occasionally answers a healthy app with a no-server
+ * edge-proxy failure instead of actually routing to it (see README,
+ * "Cold-start / spin-down behavior actually observed"). This used to try
+ * detecting that *specific* case - a `404` with an `x-render-routing:
+ * no-server` response header - and only retry that. Turned out to be dead
+ * code: that response carries no `Access-Control-Allow-Origin` header at
+ * all, so a cross-origin `fetch()` never delivers a readable `Response`
+ * for it in the first place - it just throws an opaque network error,
+ * indistinguishable from a connection reset or a DNS failure. Confirmed by
+ * reproducing the exact response shape through a real browser (Puppeteer),
+ * not assumed - the specific-detection branch simply could never execute
+ * in production.
+ *
+ * So this just retries on any thrown fetch error now - which is exactly
+ * what was actually catching the no-server case all along, via the
+ * generic path rather than the specific one that never fired. That's only
+ * safe to do broadly because every caller here is either read-only
+ * (GET /status, /download, /health - retrying can never cause harm) or
+ * made idempotent another way: POST /generate sends a stable `requestId`
+ * (see generateNotes below and the matching cache in server.js) so a
+ * retried request returns the job already created instead of creating a
+ * second one, rather than relying on being able to prove "nothing happened
+ * yet" from the response shape - which, per the above, isn't something a
+ * browser can actually observe here anyway.
  */
 async function fetchWithRetry(url: string, init: RequestInit, retries = 2, delayMs = 700): Promise<Response> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const res = await fetch(url, init);
-      if (res.status === 404 && res.headers.get("x-render-routing") === "no-server" && attempt < retries) {
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
-        continue;
-      }
-      return res;
+      return await fetch(url, init);
     } catch (err) {
       lastErr = err;
       if (attempt < retries) {
@@ -91,7 +109,17 @@ async function fetchWithRetry(url: string, init: RequestInit, retries = 2, delay
   throw lastErr;
 }
 
-/** Resolves true/false, never throws - used for the "is the server up yet" probe. */
+/**
+ * Resolves true/false, never throws - used for the "is the server up yet"
+ * probe. Deliberately does NOT use fetchWithRetry - NotesApp.tsx's
+ * `checking-server`/`server-unreachable` views already call this in their
+ * own external polling loop (every HEALTH_RETRY_MS, indefinitely until it
+ * succeeds), which is already a retry mechanism. Stacking fetchWithRetry's
+ * internal retries on top would just make each individual poll take longer
+ * (up to ~1.4s of internal backoff before reporting "still down") without
+ * changing the eventual up/down outcome - the UI would look less
+ * responsive to a genuine recovery for no real benefit.
+ */
 export async function checkHealth(timeoutMs = 3000): Promise<boolean> {
   try {
     const res = await fetch(`${API_BASE_URL}/health`, { signal: AbortSignal.timeout(timeoutMs) });
@@ -107,11 +135,32 @@ export async function checkHealth(timeoutMs = 3000): Promise<boolean> {
  * entirely and goes straight to notes generation. Omit it (or pass null,
  * e.g. the client-side fetch failed) to get the old behavior: the server
  * tries on its own, still falling back to yt-dlp/Whisper as before.
+ *
+ * A network-level failure here is genuinely ambiguous - the request could
+ * have already reached Express and created a job before the connection
+ * dropped, so a blind retry risks double-submitting. That risk turned out
+ * to matter more than it first looked: Render's no-server edge-proxy 404
+ * (the specific case fetchWithRetry's no-server branch was written to
+ * handle) ships with no CORS headers of its own at all, so from inside a
+ * real browser it never actually reaches that branch - fetch() throws an
+ * opaque network error before JS can inspect status/headers, landing in
+ * the *generic* network-error path instead (confirmed by testing the
+ * literal no-server response shape through Puppeteer, not assumed).
+ * Meaning: without something to make retry provably safe, the most common
+ * real failure this is meant to recover from would still have to be
+ * treated as unsafe-to-retry.
+ *
+ * `requestId` is that something - generated once per logical submit
+ * attempt and reused unchanged across every retry of that attempt (it's
+ * computed here, before fetchWithRetry's loop, not inside it), it lets
+ * server.js's idempotency cache return the original job on a retry instead
+ * of creating a second one. See the matching comment in server.js.
  */
 export async function generateNotes(
   youtubeUrl: string,
   clientTranscript?: { text: string; source: string } | null
 ): Promise<{ jobId: string }> {
+  const requestId = crypto.randomUUID();
   let res: Response;
   try {
     res = await fetchWithRetry(`${API_BASE_URL}/generate`, {
@@ -119,6 +168,7 @@ export async function generateNotes(
       headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({
         youtubeUrl,
+        requestId,
         ...(clientTranscript
           ? { transcript: clientTranscript.text, transcriptSource: clientTranscript.source }
           : {}),
