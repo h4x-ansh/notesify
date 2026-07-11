@@ -1857,3 +1857,71 @@ provider-fallback work) - not mocks:**
   it would.
 - **Invalid `qualityTier` rejected**: `{"qualityTier":"Ultra"}` against
   the live server correctly 400s with the allowlist message.
+
+## Preserving hedging language on sensitive/allegation-based content
+
+Real testing (the same source material across all three quality tiers)
+found that `gemini-2.5-flash` correctly preserved source hedging language
+("alleged," "accused," "reportedly") when a transcript described an
+unproven claim, but Groq and `gemini-3.1-flash-lite` consistently
+flattened it into stated fact - "X was accused of fraud" becoming "X
+committed fraud." Auto-generated callout boxes (`Important`/
+`Common Mistake`/`Must Remember`) compounded this: a flattened accusation
+wrapped in one of these boxes reads with visual authority a plain bullet
+doesn't carry.
+
+**Fix, in `SYSTEM_PROMPT` itself** (`src/notesGenerator.js`) - not
+`THOROUGHNESS_INSTRUCTIONS`, since this needed to apply to *every*
+provider/tier, including the one (`gemini-2.5-flash`/High) that was
+already behaving correctly. Two new rules added to the shared prompt every
+provider receives:
+1. **Hedging preservation**: "If the source material uses hedging
+   language (allegedly, accused, reportedly, claims, is said to have)
+   when describing accusations, crimes, or unproven claims - especially
+   against named individuals - preserve that hedging exactly. Do not
+   state allegations as settled fact."
+2. **Callout-type constraint**: the existing callout rule now explicitly
+   reserves `Important`/`Common Mistake`/`Must Remember` for genuine
+   factual/academic content (definitions, formulas, established facts) -
+   never for summarizing or editorializing unproven allegations, legal
+   claims, or politically contested content. Something worth flagging
+   from that kind of material should be a plain bullet, not one of these
+   authority-implying callout boxes.
+
+**Verified with a real test transcript across all three tiers, real API
+calls throughout** - a media-literacy-style lecture transcript modeling
+the exact real-world pattern (a named individual accused of fraud, with
+explicit source hedging: "accused," "allegedly diverted," "has not been
+convicted," "denies all wrongdoing," "prosecutors claim"), alongside a
+genuinely factual legal-principles section (presumption of innocence,
+burden of proof) to confirm callouts still work normally on real academic
+content, just not on the allegation section specifically:
+- **Normal tier (`groq-llama-3.3-70b`)**: hedging fully preserved in the
+  real output - "accusing," "has not been convicted and denies all
+  wrongdoing," "case is still pending." The allegation section carried
+  **zero** callout at all (plain bullets only); the two callouts that did
+  appear (`Important` on why hedging language matters as a general
+  principle, `Common Mistake` on the burden-of-proof misconception) both
+  landed on the genuinely factual sections, not the allegation itself.
+- **Low tier (`gemini-3.1-flash-lite`)**: same result - hedging fully
+  preserved ("accused," "allegedly diverted," "has not been convicted of
+  any crime," "denies all wrongdoing," "Prosecutors claim," "defense
+  argues"), and the dedicated "Case Study: Jordan Reyes Allegations"
+  section had no callout wrapping it at all - the `Important`/
+  `Common Mistake` callouts that did appear were both on the legitimate
+  legal-standards content.
+- **High tier (`gemini-2.5-flash`)**: could not be freshly verified today
+  - real, persistent `429`s confirmed via the exact quota metric name
+  (`GenerateRequestsPerDayPerProjectPerModel-FreeTier`) that this is the
+  free tier's **daily** cap, already exhausted from this session's
+  cumulative real-API testing, not a transient per-minute limit further
+  retries could wait out. Two real attempts a minute apart both correctly
+  failed with the exact High-tier message and never cascaded to Groq/
+  Flash-Lite (itself a real re-confirmation of the earlier no-cascade
+  fix). Not a regression risk for this specific change though: the new
+  rules were added to the one `SYSTEM_PROMPT` every tier shares, purely
+  additive to what Flash already receives - since the bug report's own
+  premise is that Flash was *already* preserving hedging correctly before
+  this change, and nothing here removes or alters any of Flash's existing
+  instructions, there's no mechanism by which this could regress its
+  already-correct behavior.

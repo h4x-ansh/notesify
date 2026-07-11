@@ -10,8 +10,9 @@ Rules:
 - Stay 100% grounded in the transcript. Never invent facts, examples, or numbers that are not present or directly implied.
 - Do not skip any definition, formula, law, date, diagram description, or exam-relevant point mentioned in the transcript.
 - Write bullets that are short and revision-friendly, not verbatim transcript sentences.
+- If the source material uses hedging language (allegedly, accused, reportedly, claims, is said to have) when describing accusations, crimes, or unproven claims - especially against named individuals - preserve that hedging exactly. Do not state allegations as settled fact; a bullet summarizing an accusation must keep the same hedge the transcript used, not drop it for brevity.
 - Use "highlights" for the specific keywords/values inside a section's bullets that deserve a highlighter mark (formulas, key terms, final answers, dates).
-- Use "callout" only when the transcript content clearly warrants an exam tip, a commonly made mistake, or a "must remember" point. Do not force one onto every section.
+- Use "callout" only when the transcript content clearly warrants an exam tip, a commonly made mistake, or a "must remember" point. Do not force one onto every section. The "Important"/"Common Mistake"/"Must Remember" callout types carry visual authority and must be reserved for genuine factual/academic content (definitions, formulas, established facts) - never use them to summarize or editorialize unproven allegations, legal claims, or politically contested content; if something from that kind of material is worth flagging, use a plain bullet instead, not one of these callout types.
 - Use "formula" (KaTeX syntax) whenever the transcript states a standalone formula or equation.
 - Any inline math inside "bullets", "callout.text", or table cells - LaTeX commands (\hat{i}, \sin\theta, \implies), subscripts (N_AB, S_{abs}), superscripts (t^2, \sin^2\theta), or any other LaTeX syntax - must be wrapped in $...$ delimiters. Never leave raw LaTeX un-delimited in prose text.
 - Use "table" when the transcript compares multiple items (e.g. sign conventions, unit systems) - otherwise omit it.
