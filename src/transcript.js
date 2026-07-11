@@ -118,10 +118,46 @@ function extractVideoId(url) {
   throw new Error(`Could not extract a video id from url: ${url}`);
 }
 
+/**
+ * youtube-transcript's raw segments come back as `{text, offset, duration}`,
+ * but the library's own XML parser (see node_modules/youtube-transcript's
+ * parseTranscriptXml) is internally inconsistent about units depending on
+ * which of YouTube's two caption formats it happened to parse: the newer
+ * srv3 format gives offset/duration in milliseconds, the older classic
+ * format gives them in fractional seconds - and neither is exposed to
+ * callers, so there's no flag to just check. A typical single caption
+ * segment spans a few seconds of speech at most; real per-segment
+ * durations in *seconds* are almost always well under 20, while the same
+ * durations in *milliseconds* are almost always in the thousands - using
+ * the median duration across all segments (not just the first, in case of
+ * one weird outlier) to tell the two apart is robust regardless of the
+ * video's total length, which a raw-magnitude check on offset alone
+ * wouldn't be (a long lecture's later offsets in seconds can plausibly
+ * exceed a short video's early offsets in milliseconds).
+ */
+function normalizeSegments(rawSegments) {
+  if (!rawSegments || rawSegments.length === 0) return [];
+  const durations = rawSegments.map((s) => s.duration).filter((d) => typeof d === "number" && d > 0);
+  const sorted = [...durations].sort((a, b) => a - b);
+  const medianDuration = sorted.length > 0 ? sorted[Math.floor(sorted.length / 2)] : 0;
+  const isMilliseconds = medianDuration > 50;
+  const divisor = isMilliseconds ? 1000 : 1;
+
+  return rawSegments
+    .filter((s) => s.text && s.text.trim().length > 0)
+    .map((s) => ({
+      text: s.text,
+      start: s.offset / divisor,
+      end: (s.offset + s.duration) / divisor,
+    }));
+}
+
 async function fetchCaptions(url) {
   const config = cookieHeader ? { fetch: cookieAwareFetch } : undefined;
-  const segments = await YoutubeTranscript.fetchTranscript(url, config);
-  return segments.map((s) => s.text).join(" ");
+  const rawSegments = await YoutubeTranscript.fetchTranscript(url, config);
+  const text = rawSegments.map((s) => s.text).join(" ");
+  const segments = normalizeSegments(rawSegments);
+  return { text, segments };
 }
 
 function run(cmd, args) {
@@ -189,13 +225,22 @@ async function transcribeViaAudioFallback(url) {
  * throwing on any failure - every caller here treats "couldn't get
  * captions" as a normal, expected outcome to fall back from, not an
  * exceptional one.
+ *
+ * `segments` (video-relative `{text, start, end}` in seconds - see
+ * normalizeSegments above) rides along with a successful captions fetch,
+ * for the timestamp-matching step in src/timestampMatcher.js (see
+ * notesGenerator.js/pipeline.js). Deliberately absent whenever this
+ * returns null or falls through to the Whisper fallback below - Whisper's
+ * output is plain transcribed text with no per-segment timing, so a video
+ * that needed it simply generates notes without timestamps rather than
+ * fabricating fake ones.
  */
 export async function fetchCaptionsOnly(url) {
   extractVideoId(url); // validate early, fail fast on a bad URL
 
   try {
-    const text = await fetchCaptions(url);
-    if (text.trim().length > 0) return { text, source: "captions" };
+    const { text, segments } = await fetchCaptions(url);
+    if (text.trim().length > 0) return { text, source: "captions", segments };
     // Fetch "succeeded" but produced no usable text - a different failure
     // mode than the catch below (e.g. a caption track whose XML doesn't
     // match either format parseTranscriptXml understands), previously

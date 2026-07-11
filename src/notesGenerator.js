@@ -1,6 +1,7 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
 import Groq from "groq-sdk";
 import { NotesSchema, geminiNotesSchema } from "./schema.js";
+import { attachTimestamps } from "./timestampMatcher.js";
 
 const SYSTEM_PROMPT = `You are a meticulous note-taker for exam aspirants.
 Transform the given lecture transcript into detailed, structured, exam-ready notes.
@@ -45,6 +46,19 @@ const JSON_SHAPE_INSTRUCTIONS = `Respond with ONLY a raw JSON object - no markdo
   ]
 }
 "formula", "table", and "callout" are optional per section - use null or omit when not warranted, never force one in.`;
+
+// Appended to SYSTEM_PROMPT for the fallback providers only (Groq's Llama
+// 70B, and gemini-3.1-flash-lite) - never for the primary gemini-2.5-flash,
+// which is already producing good depth on the base prompt alone. Smaller/
+// lighter models tend to under-elaborate on the same instructions -
+// summarizing sparsely instead of preserving the source's actual level of
+// detail - so the fallback path spells out the "don't summarize" framing
+// explicitly rather than assuming it's implied by "detailed, structured,
+// exam-ready notes" in SYSTEM_PROMPT. The JSON shape/schema requirements
+// are deliberately untouched by this - only the depth/thoroughness framing
+// differs between providers, never the output contract.
+const THOROUGHNESS_INSTRUCTIONS = `
+Additional emphasis: do not summarize sparsely. Include all examples, sub-points, and elaborations present in the source material. Err on the side of more detail per section, not less. Match the depth and thoroughness of a comprehensive study guide, not a brief summary.`;
 
 // English is the default/omitted case - no instruction added, so an old
 // request with no `language` field (or one explicitly set to "English")
@@ -112,11 +126,11 @@ function isFallThroughError(err) {
   return false;
 }
 
-async function generateWithGemini(transcript, title, modelName, language) {
+async function generateWithGemini(transcript, title, modelName, language, { thorough = false } = {}) {
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
   const model = genAI.getGenerativeModel({
     model: modelName,
-    systemInstruction: SYSTEM_PROMPT,
+    systemInstruction: thorough ? `${SYSTEM_PROMPT}\n${THOROUGHNESS_INSTRUCTIONS}` : SYSTEM_PROMPT,
     generationConfig: {
       responseMimeType: "application/json",
       responseSchema: geminiNotesSchema,
@@ -136,7 +150,7 @@ async function generateWithGroq(transcript, title, language) {
   const completion = await groq.chat.completions.create({
     model: "llama-3.3-70b-versatile",
     messages: [
-      { role: "system", content: `${SYSTEM_PROMPT}\n\n${JSON_SHAPE_INSTRUCTIONS}` },
+      { role: "system", content: `${SYSTEM_PROMPT}\n${THOROUGHNESS_INSTRUCTIONS}\n\n${JSON_SHAPE_INSTRUCTIONS}` },
       { role: "user", content: buildUserPrompt(transcript, title, language) },
     ],
     response_format: { type: "json_object" },
@@ -155,26 +169,43 @@ async function generateWithGroq(transcript, title, language) {
  * previous one hit a quota error specifically:
  *
  * 1. gemini-2.5-flash - best quality, current primary.
- * 2. gemini-3.1-flash-lite - same Google account/API key, a separate quota
- *    bucket, same native responseSchema support - a same-family swap, not
- *    a different integration. (Was gemini-2.5-flash-lite; Google returned
- *    a 404 "no longer available to new users" for that model string as of
- *    July 2026 - gemini-3.1-flash-lite is the current stable lightweight
- *    model per ai.google.dev/gemini-api/docs/models.)
- * 3. groq-llama-3.3-70b - a genuinely separate provider/account
- *    (GROQ_API_KEY), ~14,400 RPD free-tier headroom. Different model
- *    family, no native JSON-schema constraining on Groq's side - leans on
- *    JSON_SHAPE_INSTRUCTIONS in the prompt plus the same zod validation
- *    every provider's output goes through either way.
+ * 2. groq-llama-3.3-70b - tried *before* Flash-Lite: Llama 3.3 70B is a
+ *    substantially larger/more capable model than a "Lite" tier Gemini, so
+ *    it's the better fallback quality-wise despite being a genuinely
+ *    separate provider/account (GROQ_API_KEY, ~14,400 RPD free-tier
+ *    headroom) with no native JSON-schema constraining on its side - leans
+ *    on JSON_SHAPE_INSTRUCTIONS in the prompt plus the same zod validation
+ *    every provider's output goes through either way. Gets
+ *    THOROUGHNESS_INSTRUCTIONS appended (see above) - Llama tends to
+ *    under-elaborate relative to full Gemini Flash on the same base prompt.
+ * 3. gemini-3.1-flash-lite - the final safety net, not the first fallback:
+ *    same Google account/API key as step 1, a separate quota bucket, same
+ *    native responseSchema support - a same-family swap, not a different
+ *    integration. (Was gemini-2.5-flash-lite; Google returned a 404 "no
+ *    longer available to new users" for that model string as of July
+ *    2026 - gemini-3.1-flash-lite is the current stable lightweight model
+ *    per ai.google.dev/gemini-api/docs/models.) Also gets
+ *    THOROUGHNESS_INSTRUCTIONS - a "Lite" tier model is the most prone of
+ *    the three to sparse summarization on the bare prompt.
+ *
+ * `segments` (optional - see transcript.js/pipeline.js) never reaches any
+ * provider's prompt - it's applied once, after whichever provider's output
+ * has already passed schema validation, via attachTimestamps() (see
+ * timestampMatcher.js). Deliberately outside the provider loop/retry logic:
+ * it's a pure post-processing step over the final notes, independent of
+ * which provider produced them or how many fallback attempts it took.
  */
-export async function generateNotes(transcript, { title, language } = {}) {
+export async function generateNotes(transcript, { title, language, segments } = {}) {
   const providers = [
     {
       label: process.env.GEMINI_MODEL || "gemini-2.5-flash",
       run: () => generateWithGemini(transcript, title, process.env.GEMINI_MODEL || "gemini-2.5-flash", language),
     },
-    { label: "gemini-3.1-flash-lite", run: () => generateWithGemini(transcript, title, "gemini-3.1-flash-lite", language) },
     { label: "groq-llama-3.3-70b", run: () => generateWithGroq(transcript, title, language) },
+    {
+      label: "gemini-3.1-flash-lite",
+      run: () => generateWithGemini(transcript, title, "gemini-3.1-flash-lite", language, { thorough: true }),
+    },
   ];
 
   for (let i = 0; i < providers.length; i++) {
@@ -184,7 +215,7 @@ export async function generateNotes(transcript, { title, language } = {}) {
       if (i > 0) {
         console.log(`[notesGenerator] generated via fallback provider: ${provider.label}`);
       }
-      return notes;
+      return attachTimestamps(notes, segments);
     } catch (err) {
       const isLast = i === providers.length - 1;
       if (!isFallThroughError(err)) {

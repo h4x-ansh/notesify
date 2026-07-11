@@ -18,6 +18,22 @@ const Section = z.object({
   formula: z.string().nullable().optional(),
   table: Table.nullable().optional(),
   callout: Callout.nullable().optional(),
+  // Attached in code, after generation - never part of the model's own
+  // output (see src/timestampMatcher.js's doc comment for why: a model-
+  // reported timestamp risks hallucination just like any other model
+  // output, so these are a deterministic word-overlap match against real
+  // transcript segment timing, not something the prompt/schema ever asks
+  // Gemini/Groq to produce). `timestampStart` is the matched anchor point
+  // ("12:34"); `timestampRange` is a wider "12:34–18:02" span when the
+  // match covers more than a few seconds of speech. `timestampVideo`
+  // is only present for multi-video/playlist notes, disambiguating which
+  // source video the timestamp belongs to. All optional - absent entirely
+  // for a single-provider match with no timing data (Whisper fallback) or
+  // a section whose content doesn't match any transcript segment
+  // confidently enough.
+  timestampStart: z.string().optional(),
+  timestampRange: z.string().optional(),
+  timestampVideo: z.string().optional(),
 });
 
 const Page = z.object({

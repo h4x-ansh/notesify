@@ -247,6 +247,23 @@ function renderCallout(callout) {
     </div>`;
 }
 
+/**
+ * Small handwritten-style margin note next to a section's heading, e.g.
+ * "📍 12:34" or "📍 Video 2 · 12:34–18:02" for a multi-video batch - a
+ * pushpin rather than a clock face since this reads as "here's where in
+ * the source video this came from", not a duration/countdown. Absent
+ * entirely whenever timestampStart wasn't set (see timestampMatcher.js -
+ * no match confident enough, or the video's transcript had no segment
+ * timing to begin with, e.g. the Whisper fallback) - no placeholder shown,
+ * the section just renders exactly as it did before this feature existed.
+ */
+function renderTimestamp(section) {
+  if (!section.timestampStart) return "";
+  const label = section.timestampRange || section.timestampStart;
+  const videoPrefix = section.timestampVideo ? `${escapeHtml(section.timestampVideo)} · ` : "";
+  return `<span class="timestamp-tag">📍 ${videoPrefix}${escapeHtml(label)}</span>`;
+}
+
 function renderSection(section) {
   const bullets = (section.bullets || [])
     .map((b) => `<li>${renderMathAwareText(b, section.highlights)}</li>`)
@@ -254,7 +271,7 @@ function renderSection(section) {
 
   return `
     <div class="mb-8">
-      <h2 class="marker-heading text-2xl md:text-3xl mb-2">${renderMathAwareText(section.subheading)}</h2>
+      <h2 class="marker-heading text-2xl md:text-3xl mb-2">${renderMathAwareText(section.subheading)}${renderTimestamp(section)}</h2>
       <div class="line-align space-y-3">
         <ul class="list-disc pl-6 space-y-1">${bullets}</ul>
         ${renderFormula(section.formula)}
@@ -339,6 +356,7 @@ export function renderNotesHtml(notes, { styleId } = {}) {
     .scan-artifact-noise { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; opacity: 0.12; mix-blend-mode: multiply; background-image: url("${NOISE_TEXTURE_DATA_URI}"); background-repeat: repeat; background-size: 200px 200px; z-index: 40; }
     .shadow-vignette { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; box-shadow: inset 0 0 80px rgba(0,0,0,0.1); z-index: 42; border-radius: 4px; }
     .doodle { color: var(--doodle-color); opacity: var(--doodle-opacity); transform: rotate(-5deg); }
+    .timestamp-tag { font-family: 'Reenie Beanie', cursive; font-size: 1.35rem; color: var(--doodle-color); opacity: var(--doodle-opacity); margin-left: 12px; white-space: nowrap; display: inline-block; transform: rotate(-3deg); vertical-align: middle; }
     .katex { font-size: 1.05em !important; color: var(--katex-color); }
     .subject-badge { background-color: var(--badge-color); }
     .notebook-page { break-after: page; }

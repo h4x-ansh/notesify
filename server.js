@@ -180,6 +180,42 @@ const MAX_TRANSCRIPT_LENGTH = 2_000_000;
 const ALLOWED_TRANSCRIPT_SOURCES = ["captions", "captions-client", "client"];
 const MAX_REQUEST_ID_LENGTH = 200;
 
+// Timestamp references (see src/timestampMatcher.js) - optional, video-
+// relative caption segment timing a client may have captured alongside a
+// pre-fetched transcript (fetchTranscriptClientSide in lib/transcript.ts).
+// Bounds are generous relative to any real YouTube video: a multi-hour
+// lecture with one caption segment every couple of seconds is still well
+// under MAX_SEGMENTS_PER_VIDEO, and individual caption segments are always
+// short (a few seconds of speech each).
+const MAX_SEGMENTS_PER_VIDEO = 5000;
+const MAX_SEGMENT_TEXT_LENGTH = 500;
+
+function validateSegments(segments) {
+  if (segments === undefined) return null;
+  if (!Array.isArray(segments)) return "segments, if provided, must be an array";
+  if (segments.length > MAX_SEGMENTS_PER_VIDEO) {
+    return `segments must not contain more than ${MAX_SEGMENTS_PER_VIDEO} entries`;
+  }
+  for (const seg of segments) {
+    if (
+      typeof seg !== "object" ||
+      seg === null ||
+      typeof seg.text !== "string" ||
+      seg.text.length === 0 ||
+      seg.text.length > MAX_SEGMENT_TEXT_LENGTH ||
+      typeof seg.start !== "number" ||
+      typeof seg.end !== "number" ||
+      !Number.isFinite(seg.start) ||
+      !Number.isFinite(seg.end) ||
+      seg.start < 0 ||
+      seg.end < seg.start
+    ) {
+      return "each segments entry must be {text: non-empty string, start: number >= 0, end: number >= start}";
+    }
+  }
+  return null;
+}
+
 // "Multiple videos" request shapes - see frontend/components/MultiLinkInput.tsx.
 // A playlist URL just needs a `list=` param on a youtube.com/youtu.be link;
 // videoUrls entries reuse YOUTUBE_URL_PATTERN but explicitly reject a
@@ -236,6 +272,8 @@ function validateTranscriptsMap(transcripts) {
     if (value.source !== undefined && !ALLOWED_TRANSCRIPT_SOURCES.includes(value.source)) {
       return `transcripts["${url}"].source, if provided, must be one of: ${ALLOWED_TRANSCRIPT_SOURCES.join(", ")}`;
     }
+    const segmentsError = validateSegments(value.segments);
+    if (segmentsError) return `transcripts["${url}"].${segmentsError}`;
   }
   return null;
 }
@@ -284,6 +322,7 @@ app.post("/generate", requireApiSecret, generateLimiter, async (req, res) => {
     youtubeUrl,
     transcript,
     transcriptSource,
+    segments,
     requestId,
     videoUrls,
     playlistUrl,
@@ -339,6 +378,8 @@ app.post("/generate", requireApiSecret, generateLimiter, async (req, res) => {
   if (transcriptSource !== undefined && !ALLOWED_TRANSCRIPT_SOURCES.includes(transcriptSource)) {
     return res.status(400).json({ error: `transcriptSource, if provided, must be one of: ${ALLOWED_TRANSCRIPT_SOURCES.join(", ")}` });
   }
+  const topLevelSegmentsError = validateSegments(segments);
+  if (topLevelSegmentsError) return res.status(400).json({ error: topLevelSegmentsError });
   if (requestId !== undefined && (typeof requestId !== "string" || requestId.length === 0 || requestId.length > MAX_REQUEST_ID_LENGTH)) {
     return res.status(400).json({ error: "requestId, if provided, must be a non-empty string" });
   }
@@ -466,9 +507,15 @@ app.post("/generate", requireApiSecret, generateLimiter, async (req, res) => {
   // blocked-IP problem for the mobile app (see the README's client-side
   // transcript-fetch section). If it's absent (client didn't try, or its
   // fetch failed), runPipeline falls through to the exact same server-side
-  // captions-then-yt-dlp flow as before - unaffected either way.
+  // captions-then-yt-dlp flow as before - unaffected either way. `segments`
+  // (optional, see validateSegments above) rides along the same way -
+  // absent when the client's fetch didn't produce per-segment timing,
+  // in which case generateNotes() just skips timestamp-matching for this
+  // video (see timestampMatcher.js).
   const preFetchedTranscript =
-    transcript && transcript.trim().length > 0 ? { text: transcript, source: transcriptSource || "client" } : null;
+    transcript && transcript.trim().length > 0
+      ? { text: transcript, source: transcriptSource || "client", segments }
+      : null;
 
   // Fire and forget: the route responds immediately with the jobId, the
   // pipeline keeps running in the background and reports progress via

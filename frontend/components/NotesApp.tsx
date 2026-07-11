@@ -111,8 +111,8 @@ function rateLimitCooldownMs(): number {
 async function prefetchTranscripts(
   urls: string[],
   onProgress: (label: string) => void
-): Promise<Record<string, { text: string; source: string }>> {
-  const transcripts: Record<string, { text: string; source: string }> = {};
+): Promise<Record<string, { text: string; source: string; segments?: { text: string; start: number; end: number }[] }>> {
+  const transcripts: Record<string, { text: string; source: string; segments?: { text: string; start: number; end: number }[] }> = {};
   for (let i = 0; i < urls.length; i++) {
     onProgress(`Fetching transcripts on-device (${i + 1} of ${urls.length})...`);
     const result = await fetchTranscriptClientSide(urls[i]);

@@ -229,7 +229,7 @@ function languageStyleFields({ language, styleId }: LanguageStyleOptions = {}) {
  */
 export async function generateNotes(
   youtubeUrl: string,
-  clientTranscript?: { text: string; source: string } | null,
+  clientTranscript?: { text: string; source: string; segments?: { text: string; start: number; end: number }[] } | null,
   options?: LanguageStyleOptions
 ): Promise<{ jobId: string }> {
   const requestId = crypto.randomUUID();
@@ -242,7 +242,17 @@ export async function generateNotes(
         youtubeUrl,
         requestId,
         ...(clientTranscript
-          ? { transcript: clientTranscript.text, transcriptSource: clientTranscript.source }
+          ? {
+              transcript: clientTranscript.text,
+              transcriptSource: clientTranscript.source,
+              // Video-relative caption timing, when the client-side fetch
+              // produced it - see lib/transcript.ts's fetchTranscriptClientSide
+              // and server.js's validateSegments. Powers the timestamp
+              // references on generated notes (src/timestampMatcher.js);
+              // simply omitted when unavailable, no different from before
+              // this field existed.
+              ...(clientTranscript.segments?.length ? { segments: clientTranscript.segments } : {}),
+            }
           : {}),
         ...languageStyleFields(options),
       }),
@@ -343,7 +353,10 @@ export async function generateNotesBatch(
     // solves) - keyed by the exact video URL fetched. A video missing from
     // this map falls through to the server's own captions-then-yt-dlp/
     // Whisper attempt, same as if this option were omitted entirely.
-    transcripts?: Record<string, { text: string; source: string }>;
+    // `segments`, when present per video, powers that video's timestamp
+    // references (src/timestampMatcher.js server-side) - optional, same
+    // graceful-degradation rule as the single-video path.
+    transcripts?: Record<string, { text: string; source: string; segments?: { text: string; start: number; end: number }[] }>;
   }
 ): Promise<GenerateBatchResult> {
   const requestId = crypto.randomUUID();

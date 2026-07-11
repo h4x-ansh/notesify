@@ -55,15 +55,24 @@ async function fetchAndMergeTranscripts(urls, onUpdate, preFetchedTranscripts = 
     // instead of this server's (Render's, when hosted), which YouTube has
     // been blocking. Missing/empty entries fall through to the exact same
     // server-side captions-then-yt-dlp/Whisper flow as before, per video.
+    // `segments` (video-relative timing, when available - see
+    // transcript.js/mergeSegments below) rides along the same way as text/
+    // source, whichever path produced it.
     const preFetched = preFetchedTranscripts?.[url];
     if (preFetched?.text) {
-      results.push({ url, title, text: preFetched.text, source: preFetched.source || "captions-client" });
+      results.push({
+        url,
+        title,
+        text: preFetched.text,
+        source: preFetched.source || "captions-client",
+        segments: preFetched.segments,
+      });
       continue;
     }
 
     try {
-      const { text, source } = await getTranscript(url);
-      results.push({ url, title, text, source });
+      const { text, source, segments } = await getTranscript(url);
+      results.push({ url, title, text, source, segments });
     } catch (err) {
       console.error(`[pipeline] skipping video in batch (${url}):`, err.message);
       results.push({ url, title, skipped: true, reason: err.message });
@@ -86,6 +95,34 @@ function mergeTranscripts(results) {
     .filter((r) => !r.skipped)
     .map((r, i) => `--- Video ${i + 1}: ${r.title} ---\n${r.text}`)
     .join("\n\n");
+}
+
+/**
+ * Flattens each successful video's segments into one list for
+ * timestampMatcher.js, tagging every segment with the same 1-based video
+ * index/title mergeTranscripts uses in its own `--- Video N: ... ---`
+ * markers - so a section's matched timestamp can always be traced back to
+ * exactly one video's own timeline, never ambiguous about which video
+ * "18:02" refers to in a merged multi-video transcript (each video's
+ * segments are independently 0-based, relative to its own start).
+ *
+ * A video with no segments at all (Whisper fallback - see transcript.js -
+ * or a client-side fetch that didn't produce timing data) simply
+ * contributes nothing here; its own content just won't get matched to a
+ * timestamp, the graceful-degradation behavior timestampMatcher.js already
+ * has for a single video with no segments, applied per-video in a batch.
+ */
+function mergeSegments(results) {
+  const merged = [];
+  let videoIndex = 0;
+  for (const r of results) {
+    if (r.skipped) continue;
+    videoIndex++;
+    for (const seg of r.segments || []) {
+      merged.push({ ...seg, videoIndex, videoTitle: r.title });
+    }
+  }
+  return merged;
 }
 
 function summarizeSkipped(results) {
@@ -132,11 +169,23 @@ function summarizeSkipped(results) {
  *
  * `preFetchedTranscripts` (plural, distinct from the single-video
  * `preFetchedTranscript` above) is the batch/playlist equivalent - a map of
- * video URL -> {text, source} for whichever videos the client already
- * fetched captions for itself (see the frontend's per-video prefetch loop,
- * added to close the same Render-IP-blocking gap the single-video path
- * already solved). Passed straight through to fetchAndMergeTranscripts,
- * which checks it per video before falling back to getTranscript().
+ * video URL -> {text, source, segments} for whichever videos the client
+ * already fetched captions for itself (see the frontend's per-video
+ * prefetch loop, added to close the same Render-IP-blocking gap the
+ * single-video path already solved). Passed straight through to
+ * fetchAndMergeTranscripts, which checks it per video before falling back
+ * to getTranscript().
+ *
+ * `segments` (video-relative caption timing - see transcript.js's
+ * normalizeSegments) flows alongside `transcript`/`source` from whichever
+ * branch produced it - a single video's own segments as-is, or
+ * mergeSegments' video-tagged flattening for a batch/playlist - and is
+ * handed to generateNotes() for the timestamp-matching step (see
+ * timestampMatcher.js). Naturally absent (undefined) whenever the source
+ * didn't have per-segment timing to begin with (the Whisper fallback,
+ * or a client-side fetch that didn't produce it) - generateNotes()
+ * degrades gracefully to notes with no timestamps in that case, not an
+ * error.
  */
 export async function runPipeline(
   youtubeUrl,
@@ -154,7 +203,7 @@ export async function runPipeline(
   try {
     await mkdir(path.dirname(outputPath), { recursive: true });
 
-    let transcript, source;
+    let transcript, source, segments;
     let skippedVideos = [];
 
     if (playlistUrl) {
@@ -167,6 +216,7 @@ export async function runPipeline(
         throw new PipelineError("Couldn't get a transcript for any video in this playlist.", "transcript_unavailable");
       }
       transcript = mergeTranscripts(results);
+      segments = mergeSegments(results);
       source = "playlist-merged";
       skippedVideos = summarizeSkipped(results);
     } else if (videoUrls) {
@@ -176,13 +226,14 @@ export async function runPipeline(
         throw new PipelineError("Couldn't get a transcript for any of the provided videos.", "transcript_unavailable");
       }
       transcript = mergeTranscripts(results);
+      segments = mergeSegments(results);
       source = "batch-merged";
       skippedVideos = summarizeSkipped(results);
     } else if (preFetchedTranscript) {
-      ({ text: transcript, source } = preFetchedTranscript);
+      ({ text: transcript, source, segments } = preFetchedTranscript);
     } else {
       onUpdate({ stage: "extracting_transcript", progress: 5 });
-      ({ text: transcript, source } = await getTranscript(youtubeUrl));
+      ({ text: transcript, source, segments } = await getTranscript(youtubeUrl));
     }
 
     onUpdate({
@@ -199,7 +250,7 @@ export async function runPipeline(
     });
 
     onUpdate({ stage: "generating_notes", progress: 35 });
-    const notes = await generateNotes(transcript, { language });
+    const notes = await generateNotes(transcript, { language, segments });
     onUpdate({
       stage: "generating_notes",
       progress: 65,

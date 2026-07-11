@@ -494,25 +494,42 @@ through a provider chain instead of hard-failing the moment Gemini's quota
 is hit:
 
 1. **`gemini-2.5-flash`** (`GEMINI_MODEL` overridable) - current primary,
-   best quality.
-2. **`gemini-3.1-flash-lite`** - same `GEMINI_API_KEY`/Google account, but a
-   separate quota bucket from `-flash`'s, and the same native
-   `responseSchema` constraining - a same-family model-string swap, not a
-   different integration. (Was `gemini-2.5-flash-lite` until Google started
-   returning a `404 "This model models/gemini-2.5-flash-lite is no longer
-   available to new users"` for it - see "Stale model string" below.
+   best quality. Unmodified base prompt - already producing good depth on
+   its own.
+2. **Groq's `llama-3.3-70b-versatile`** (`GROQ_API_KEY`, free at
+   [console.groq.com/keys](https://console.groq.com/keys)) - tried *before*
+   Flash-Lite: Llama 3.3 70B is a substantially larger/more capable model
+   than a "Lite" tier Gemini, so it's the better fallback quality-wise
+   despite being a genuinely separate provider/account, ~14,400 RPD
+   free-tier headroom. Different model family with no native JSON-schema
+   constraining on Groq's side, so the prompt spells out the exact shape
+   explicitly (`JSON_SHAPE_INSTRUCTIONS`) on top of
+   `response_format: json_object` (valid-JSON-guaranteed, not shape-
+   guaranteed) - the same zod (`NotesSchema`) validation every provider's
+   output goes through either way is still the real gate, not the prompt
+   wording.
+3. **`gemini-3.1-flash-lite`** - the final safety net, not the first
+   fallback. Same `GEMINI_API_KEY`/Google account, but a separate quota
+   bucket from `-flash`'s, and the same native `responseSchema`
+   constraining - a same-family model-string swap, not a different
+   integration. (Was `gemini-2.5-flash-lite` until Google started returning
+   a `404 "This model models/gemini-2.5-flash-lite is no longer available
+   to new users"` for it - see "Stale model string" below.
    `gemini-3.1-flash-lite` is the current stable lightweight model per
    [ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models),
    confirmed generally available, not preview.)
-3. **Groq's `llama-3.3-70b-versatile`** (`GROQ_API_KEY`, free at
-   [console.groq.com/keys](https://console.groq.com/keys)) - a genuinely
-   separate provider/account, ~14,400 RPD free-tier headroom. Different
-   model family with no native JSON-schema constraining on Groq's side, so
-   the prompt spells out the exact shape explicitly
-   (`JSON_SHAPE_INSTRUCTIONS`) on top of `response_format: json_object`
-   (valid-JSON-guaranteed, not shape-guaranteed) - the same zod
-   (`NotesSchema`) validation every provider's output goes through either
-   way is still the real gate, not the prompt wording.
+
+**Provider-specific prompt depth** (`THOROUGHNESS_INSTRUCTIONS` in
+`src/notesGenerator.js`): lighter/smaller models tend to under-elaborate
+relative to full Gemini Flash on the exact same base instructions -
+summarizing sparsely instead of preserving the source's actual level of
+detail. Steps 2 and 3 (Groq, Flash-Lite) get an explicit "do not summarize
+sparsely - include all examples, sub-points, and elaborations... match the
+depth of a comprehensive study guide, not a brief summary" instruction
+appended to the system prompt; step 1 (the primary) keeps the base prompt
+untouched, since it doesn't need it. The JSON shape/schema requirements
+(`JSON_SHAPE_INSTRUCTIONS`) are identical across all three providers -
+only this depth/thoroughness framing differs.
 
 **Advances on a quota error, or a 404 "model no longer available" error** -
 `isFallThroughError()` (was `isQuotaError()` - renamed when the second
@@ -595,6 +612,51 @@ completely real:
   immediately, Groq never called - confirms `isFallThroughError()`'s
   broadened matching didn't loosen the "only fall through on a fixable-
   by-switching-provider error" guarantee.
+
+(The two bullets above describe verification done under the *previous*
+step 2/3 order - `gemini-3.1-flash-lite` then Groq. Steps 2 and 3 were
+later swapped - see "Chain reorder + per-provider prompt depth" below -
+so re-read them as historical record of that specific test, not the
+current order.)
+
+**Chain reorder + per-provider prompt depth, verified with a real side-
+by-side comparison** (same real MIT 6.006 lecture transcript used
+elsewhere in this README, ~33K chars): rather than trusting "should
+theoretically help," the same transcript was run through all three
+providers for real, both before and after the `THOROUGHNESS_INSTRUCTIONS`
+change, and the actual output compared directly - not just page/bullet
+counts (which turned out ambiguous on their own - see below) but the real
+bullet text.
+- **Reorder confirmed end-to-end**: forcing `gemini-2.5-flash` to fail
+  landed on a **real Groq call** (not Flash-Lite) - confirmed via a
+  request-seen flag on each provider's real endpoint, not inferred.
+  Forcing both `gemini-2.5-flash` and Groq to fail landed on a real
+  `gemini-3.1-flash-lite` call last. Matches the new 1→2→3 order exactly.
+- **Groq, before vs. after the thoroughness prompt** (real calls, same
+  transcript): bullet *count* barely moved (25 → 24), but average bullet
+  length grew 55.1 → 67.7 chars (+23%), and a duplicate "Overview of the
+  Course" section present in the "before" output was gone in "after" -
+  replaced by a more specific "Common Functions and Asymptotic Notation"
+  section pulling out content that used to be buried in a single
+  "Asymptotic Analysis" section. Net: less redundancy, more distinct
+  technical content actually broken out.
+- **Flash-Lite, before vs. after** (real calls, same transcript): this one
+  was genuinely mixed, not a clean win, and is reported as such rather
+  than rounded up - section count dropped 8 → 6 (an administrative "Course
+  Roadmap" quiz-schedule section was dropped entirely in "after," and a
+  "Runtime Growth Classes" section got folded into "Asymptotic Analysis"
+  as a single bullet). But reading the actual bullet text side by side,
+  the academic content that remained is genuinely more elaborated: the
+  Birthday Problem algorithm went from one compressed bullet ("maintain a
+  record, iterate through individuals...") to an explicit 5-step numbered
+  breakdown; "before" had no callout on the course-overview section at
+  all, "after" added a real one explaining the course's proof-writing
+  emphasis; the consolidated growth-classes bullet in "after" actually
+  lists *more* distinct complexity classes (added "quadratic") than the
+  dedicated section it replaced. Net for Flash-Lite: real, visible gains
+  in per-section depth on the content that matters most, at the cost of
+  dropping one non-academic administrative section - not a false "purely
+  positive" claim.
 
 ## Mobile app (Capacitor/Android)
 
@@ -1443,3 +1505,109 @@ own doc comment) and real videos - not mocks:**
   this exact same `prefetchTranscripts`/`generateNotesBatch` mechanism -
   already proven above - the only difference is flattening multiple chunks'
   URLs into one prefetch pass before submitting with `confirmChunking: true`.
+
+## Timestamp references on generated notes
+
+Each transcript segment YouTube's caption source returns already carries
+its own timing (`{text, offset, duration}`), but that timing was being
+discarded during the flatten-to-plain-text step every provider (client-side
+fetch, server-side captions, the pipeline's batch merge) has always done
+before handing a transcript to Gemini/Groq. Sections now carry an optional
+timestamp reference back to roughly where in the source video they came
+from.
+
+**Preserving segment timing** (`src/transcript.js`'s `normalizeSegments`,
+duplicated for the frontend's own youtube-transcript install in
+`frontend/lib/transcript.ts`): youtube-transcript's own XML parser is
+internally inconsistent about units - the newer srv3 caption format gives
+`offset`/`duration` in milliseconds, the older classic format gives
+fractional seconds, with no flag exposed to tell them apart. A median-
+duration heuristic (real per-segment speech durations in seconds are
+almost always under 20; in milliseconds they're almost always in the
+thousands) normalizes both to `{text, start, end}` in seconds, robust
+regardless of the video's total length. Both `fetchCaptionsOnly` (server-
+side, also reused as-is by Electron's IPC handler) and
+`fetchTranscriptClientSide` (client-side - browser/mobile's direct
+`YoutubeTranscript.fetchTranscript()` call, or Electron's IPC bridge)
+return `segments` alongside `text`/`source` now. The Whisper audio-
+transcription fallback (no per-segment timing available from that API)
+simply never sets it - the one branch of `getTranscript()` that doesn't.
+
+**Code-matched, not model-reported** (`src/timestampMatcher.js`, new
+module): each section's timestamp is a deterministic word-overlap match
+against the real segment timing, computed entirely in code *after* a
+provider's output has already passed schema validation - never sent to
+Gemini/Groq's prompt or schema at all. This was a deliberate choice over
+asking the model to report its own timestamps: a model-reported timestamp
+risks hallucinating a plausible-looking value with no real relation to the
+video, the same way any other model output can be wrong, whereas a word-
+overlap match against real segment data doesn't depend on model honesty.
+For each section, every transcript segment is scored by how many
+significant words (`\p{L}\p{N}`-based tokenization - Unicode-aware, not
+ASCII-only, since this app generates notes in Hindi/Tamil/Bengali and
+transcripts themselves can be in any script) it shares with the section's
+subheading/bullets/formula/callout/table text; the best-scoring segment
+becomes the anchor (`timestampStart`), with a `timestampRange` added when
+segments within a tight ±60s window of the anchor also match. Below a
+minimum shared-word threshold, the section is left with no timestamp
+fields at all - no guessing.
+
+**Multi-video/batch scoping** (`src/pipeline.js`'s new `mergeSegments`):
+each video's segments are tagged with the same 1-based video index/title
+`mergeTranscripts`'s own `--- Video N: ... ---` markers already use, so a
+match can never straddle two different videos' independent (each 0-based)
+timelines. A section whose anchor lands on video 2's segments gets a
+`timestampVideo` field ("Video 2" or that video's real title) alongside
+its timestamp - single-video notes never carry this field at all, since
+there's nothing to disambiguate.
+
+**Template** (`src/template.js`): a small pushpin annotation next to the
+section heading - `📍 12:34` or `📍 Video 2 · 12:34–18:02` - set in
+'Reenie Beanie' (a handwriting font this template already loaded for
+exactly this kind of decorative marginalia, but had never actually used
+anywhere until now). Absent entirely when the section has no
+`timestampStart`, so old notes (or Whisper-sourced ones) render exactly as
+they did before this feature existed.
+
+**Verified with a real video, a real multi-video batch, and real
+graceful-degradation - not synthetic data (a synthetic-data unit test of
+the matching logic itself was also run first, to catch bugs cheaply before
+spending real Gemini calls):**
+- **Real single video** (an MIT 6.006 lecture, ~45 minutes, 1135 real
+  caption segments): all 6 generated sections got a timestamp, strictly
+  increasing across the lecture's real 45-minute runtime (1:10 → 4:17 →
+  10:38 → 21:59 → 29:54 → 42:22) - exactly the structure of a real intro
+  lecture (overview, definitions, algorithm concept, correctness proofs,
+  complexity, computational model). **Spot-checked 3 of them directly
+  against the real transcript text at that exact second** - "Defining
+  Computational Problems" (4:17) landed on the real segment literally
+  saying "a problem is a binary relation between these inputs and
+  outputs"; "Proving Correctness" (21:59) landed on "assume the inductive
+  hypothesis true for K..."; "Model of Computation: Word RAM" (42:22)
+  landed on "I can read and write from an address in memory... in
+  constant time" - all three a direct, accurate match to the section's
+  real content. Rendered to a real PDF and visually confirmed the 📍
+  annotation renders correctly, subtly, in the handwriting font next to
+  each heading.
+- **Real 2-video batch** ("Me at the zoo" + a Korean-language music
+  video): the elephant section correctly got `📍 Me at the zoo · 0:01–0:13`
+  - unambiguous about which video, visually confirmed in a real rendered
+  PDF. The Gangnam Style section got **no** timestamp - not a bug: its
+  generated notes are an English summary/paraphrase of Korean lyrics, so
+  there's genuinely no real word overlap between the English section text
+  and the Korean transcript segments for a word-overlap match to find -
+  exactly the "no confident match → say nothing, don't guess" behavior
+  the design calls for, working correctly on a real case where the
+  approach's actual limits show up. (This same real test caught and fixed
+  a genuine bug: the first tokenizer version only matched `[a-z0-9]`,
+  silently producing zero usable words for any non-Latin-script segment -
+  fixed to Unicode-aware `\p{L}\p{N}` matching, which is what let the
+  video-scoping/tagging itself work correctly here even though the
+  cross-language section still couldn't match.)
+- **Graceful degradation, no segment data at all** (simulating the
+  Whisper-fallback case - a real transcript fetched normally, but
+  `generateNotes()` deliberately called without its `segments` option):
+  notes generated successfully with no errors, zero `timestampStart`
+  fields anywhere in the output, and the template rendered with no
+  `timestamp-tag` markup at all - confirming the feature is fully
+  additive, never a hard dependency for generation to succeed.
