@@ -7,15 +7,20 @@ import {
   checkHealth,
   fetchPdf,
   generateNotes,
+  generateNotesBatch,
   getStatus,
   IS_HOSTED_BACKEND,
   isRateLimitError,
   looksLikeYoutubeUrl,
+  type BatchPayload,
+  type Language,
   type Stage,
   type StatusResponse,
 } from "@/lib/api";
 import { fetchTranscriptClientSide } from "@/lib/transcript";
 import { isNativeMobile, savePdfOnMobile, type SavePdfResult } from "@/lib/downloadPdf";
+import MultiLinkInput from "./MultiLinkInput";
+import LanguageStylePicker from "./LanguageStylePicker";
 
 const STAGE_LABELS: Record<Stage, string> = {
   queued: "Queued...",
@@ -30,10 +35,22 @@ const POLL_INTERVAL_MS = 2000;
 const HEALTH_RETRY_MS = 2000;
 const MAX_CONSECUTIVE_POLL_FAILURES = 5;
 
+// What the picker screen (LanguageStylePicker) generates from, deferred
+// until its own "Generate" click - see handleGenerate. "single" carries
+// just the raw URL, not a fetched transcript: the client-side transcript
+// fetch itself is deferred to generate-time too (see handleGenerate),
+// since it's most naturally sequenced right before the request that needs
+// it, and doing it earlier (e.g. during video selection) would mean
+// juggling its result across a screen transition for no real benefit.
+type PendingSource = { type: "single"; url: string } | { type: "batch"; payload: BatchPayload };
+
 type View =
   | { kind: "checking-server" }
   | { kind: "server-unreachable" }
+  | { kind: "mode-choice" }
   | { kind: "input" }
+  | { kind: "multi-link" }
+  | { kind: "picker"; source: PendingSource }
   | { kind: "progress"; jobId: string; status: StatusResponse; reconnecting: boolean }
   | { kind: "done"; jobId: string; status: StatusResponse }
   | { kind: "error"; message: string; rateLimited: boolean; cooldownUntil: number | null };
@@ -47,7 +64,6 @@ export default function NotesApp() {
   const [view, setView] = useState<View>({ kind: "checking-server" });
   const [url, setUrl] = useState("");
   const [urlError, setUrlError] = useState<string | null>(null);
-  const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [submitPhase, setSubmitPhase] = useState<"transcript" | "starting" | null>(null);
 
@@ -72,7 +88,7 @@ export default function NotesApp() {
       const healthy = await checkHealth();
       if (cancelled) return;
       if (healthy) {
-        setView((v) => (v.kind === "checking-server" || v.kind === "server-unreachable" ? { kind: "input" } : v));
+        setView((v) => (v.kind === "checking-server" || v.kind === "server-unreachable" ? { kind: "mode-choice" } : v));
       } else {
         setView({ kind: "server-unreachable" });
         retryTimer = setTimeout(probe, HEALTH_RETRY_MS);
@@ -177,52 +193,68 @@ export default function NotesApp() {
     };
   }, [view.kind === "done" ? view.jobId : null, pdfRetryTick]);
 
-  function resetToInput() {
+  // Named "toStart" rather than "toInput" since there's now a mode-choice
+  // screen before the single-video input form - both "Try again" and
+  // "Generate another" return there rather than assuming the user wants
+  // the same mode (single vs. multiple) as their last job.
+  function resetToStart() {
     if (cooldownRemainingMs > 0) return;
     pollFailuresRef.current = 0;
-    setSubmitError(null);
-    setView({ kind: "input" });
+    setView({ kind: "mode-choice" });
   }
 
-  async function handleSubmit(e: React.FormEvent) {
+  // Validation only now - the actual request (including the language/style
+  // picker's choices) doesn't fire until handleGenerate, from the new
+  // picker screen this now leads to. The form's own submit/validation
+  // logic is otherwise unchanged from before the picker existed.
+  function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!looksLikeYoutubeUrl(url)) {
       setUrlError("That doesn't look like a YouTube URL.");
       return;
     }
     setUrlError(null);
-    setSubmitError(null);
+    setView({ kind: "picker", source: { type: "single", url: url.trim() } });
+  }
+
+  // "Multiple videos" path (see MultiLinkInput.tsx) - collects the batch
+  // payload, then also lands on the picker rather than submitting directly.
+  function handleBatchNext(payload: BatchPayload) {
+    setView({ kind: "picker", source: { type: "batch", payload } });
+  }
+
+  // The actual submission, for both paths - fired from the picker screen's
+  // "Generate" button, language/styleId chosen there. Single-video's
+  // client-side transcript pre-fetch (unchanged logic, just moved here from
+  // the old handleSubmit) still isn't attempted for a batch source - that's
+  // tied to one known video URL, and a batch/playlist's transcripts are
+  // fetched server-side per video either way (see src/pipeline.js).
+  async function handleGenerate(source: PendingSource, language: Language, styleId: string) {
     setSubmitting(true);
     try {
-      // Try fetching captions ourselves first - on the client's own IP
-      // (Electron: the user's machine via main-process IPC; mobile: the
-      // device's own network via CapacitorHttp) rather than the hosted
-      // backend's, which is what YouTube has been blocking (see the
-      // caption-fetch investigation and client-side transcript-fetch
-      // sections in the root README). A failure here isn't an error state -
-      // it's expected and handled by simply not sending a transcript, which
-      // makes the server fall back to its own captions-then-yt-dlp attempt
-      // exactly as before.
-      setSubmitPhase("transcript");
-      const clientTranscript = await fetchTranscriptClientSide(url.trim());
-
-      setSubmitPhase("starting");
-      const { jobId } = await generateNotes(url.trim(), clientTranscript);
+      let jobId: string;
+      if (source.type === "single") {
+        setSubmitPhase("transcript");
+        const clientTranscript = await fetchTranscriptClientSide(source.url);
+        setSubmitPhase("starting");
+        ({ jobId } = await generateNotes(source.url, clientTranscript, { language, styleId }));
+      } else {
+        ({ jobId } = await generateNotesBatch(source.payload, { language, styleId }));
+      }
       pollFailuresRef.current = 0;
       setView({ kind: "progress", jobId, status: { stage: "queued", progress: 0, error: null }, reconnecting: false });
     } catch (err) {
       if (err instanceof ApiError && !err.status) {
-        // No status code = the fetch itself failed, i.e. the server dropped.
         setView({ kind: "server-unreachable" });
       } else {
         const message = err instanceof Error ? err.message : "Failed to start generation.";
-        if (isRateLimitError(message)) {
-          // Rate limit hit before a job even started - route through the same
-          // error+cooldown view rather than the inline input-screen error.
-          setView({ kind: "error", message, rateLimited: true, cooldownUntil: Date.now() + rateLimitCooldownMs() });
-        } else {
-          setSubmitError(message);
-        }
+        const rateLimited = isRateLimitError(message);
+        setView({
+          kind: "error",
+          message,
+          rateLimited,
+          cooldownUntil: rateLimited ? Date.now() + rateLimitCooldownMs() : null,
+        });
       }
     } finally {
       setSubmitting(false);
@@ -262,6 +294,33 @@ export default function NotesApp() {
           </div>
         )}
 
+        {view.kind === "mode-choice" && (
+          <div>
+            <p className={styles.title}>Generate handwritten notes</p>
+            <p className={styles.subtitle}>How many videos are you working from?</p>
+            <div className={styles.actions}>
+              <button
+                type="button"
+                className={`${styles.button} ${styles.buttonPrimary}`}
+                onClick={() => setView({ kind: "input" })}
+              >
+                Single video
+              </button>
+              <button
+                type="button"
+                className={`${styles.button} ${styles.buttonGhost}`}
+                onClick={() => setView({ kind: "multi-link" })}
+              >
+                Multiple videos
+              </button>
+            </div>
+          </div>
+        )}
+
+        {view.kind === "multi-link" && (
+          <MultiLinkInput onBack={() => setView({ kind: "mode-choice" })} onSubmit={handleBatchNext} submitting={false} />
+        )}
+
         {view.kind === "input" && (
           <form onSubmit={handleSubmit}>
             <p className={styles.title}>Generate handwritten notes</p>
@@ -287,17 +346,25 @@ export default function NotesApp() {
               {urlError && <p className={styles.fieldError}>{urlError}</p>}
             </div>
 
-            <button type="submit" className={`${styles.button} ${styles.buttonPrimary}`} disabled={submitting || !url.trim()}>
-              {submitPhase === "transcript"
-                ? "Fetching transcript..."
-                : submitting
-                  ? "Generating..."
-                  : "Generate Notes"}
+            {/* No generation happens from this screen anymore - a
+                language/style picker comes next (see the "picker" view
+                below); this just validates and moves on, same as
+                MultiLinkInput's "Next" for the multi-video path. */}
+            <button type="submit" className={`${styles.button} ${styles.buttonPrimary}`} disabled={!url.trim()}>
+              Next
             </button>
-            {submitError && <p className={styles.fieldError}>{submitError}</p>}
 
             <p className={styles.hint}>Works best with lecture videos that have captions. Typically takes 30-60 seconds.</p>
           </form>
+        )}
+
+        {view.kind === "picker" && (
+          <LanguageStylePicker
+            onBack={() => setView(view.source.type === "single" ? { kind: "input" } : { kind: "multi-link" })}
+            onGenerate={(language, styleId) => handleGenerate(view.source, language, styleId)}
+            submitting={submitting}
+            submitLabel={submitPhase === "transcript" ? "Fetching transcript..." : "Generating..."}
+          />
         )}
 
         {view.kind === "progress" && (
@@ -308,7 +375,12 @@ export default function NotesApp() {
                 Lost connection to the {IS_HOSTED_BACKEND ? "" : "local "}server - retrying...
               </div>
             )}
-            <p className={styles.stageLabel}>{STAGE_LABELS[view.status.stage]}</p>
+            <p className={styles.stageLabel}>
+              {/* "Multiple videos" flow: batchProgress ("Fetching video 2 of
+                  4...") is more specific than the generic per-stage label
+                  below, so it takes priority while present. */}
+              {view.status.batchProgress || STAGE_LABELS[view.status.stage]}
+            </p>
             <div className={styles.progressTrack}>
               <div className={styles.progressFill} style={{ width: `${view.status.progress}%` }} />
             </div>
@@ -344,7 +416,7 @@ export default function NotesApp() {
             </div>
             <button
               className={`${styles.button} ${styles.buttonPrimary}`}
-              onClick={resetToInput}
+              onClick={resetToStart}
               disabled={cooldownRemainingMs > 0}
             >
               {cooldownRemainingMs > 0 ? `Try again in ${Math.ceil(cooldownRemainingMs / 1000)}s` : "Try again"}
@@ -362,6 +434,19 @@ export default function NotesApp() {
               <p className={styles.subtitle} style={{ marginTop: 0 }}>
                 {view.status.pageCount} page(s) rendered.
               </p>
+            )}
+
+            {view.status.skippedVideos && view.status.skippedVideos.length > 0 && (
+              <div className={styles.metaLog}>
+                <p className={styles.metaLine}>
+                  {view.status.skippedVideos.length} video{view.status.skippedVideos.length === 1 ? "" : "s"} skipped:
+                </p>
+                {view.status.skippedVideos.map((v) => (
+                  <p className={styles.metaLine} key={v.url}>
+                    &quot;{v.title}&quot; - {v.reason}
+                  </p>
+                ))}
+              </div>
             )}
 
             <div className={styles.actions}>
@@ -400,7 +485,7 @@ export default function NotesApp() {
                   {pdf.status === "loading" ? "Preparing download..." : "Couldn't load PDF"}
                 </button>
               )}
-              <button className={styles.linkButton} onClick={resetToInput}>
+              <button className={styles.linkButton} onClick={resetToStart}>
                 Generate another
               </button>
             </div>

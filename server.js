@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runPipeline } from "./src/pipeline.js";
 import { createJob, updateJob, getJob, listJobs } from "./src/jobStore.js";
+import { STYLE_PRESETS } from "./src/template.js";
 
 /**
  * API wrapping the same pipeline the CLI uses. Runs two ways: spawned
@@ -163,17 +164,65 @@ const MAX_TRANSCRIPT_LENGTH = 2_000_000;
 const ALLOWED_TRANSCRIPT_SOURCES = ["captions", "captions-client", "client"];
 const MAX_REQUEST_ID_LENGTH = 200;
 
-app.post("/generate", requireApiSecret, generateLimiter, (req, res) => {
-  const { youtubeUrl, transcript, transcriptSource, requestId } = req.body ?? {};
+// "Multiple videos" request shapes - see frontend/components/MultiLinkInput.tsx.
+// A playlist URL just needs a `list=` param on a youtube.com/youtu.be link;
+// videoUrls entries reuse YOUTUBE_URL_PATTERN but explicitly reject a
+// `list=` param each (that should have been sent as playlistUrl instead) -
+// defense in depth against a client sending a mismatched shape, since the
+// frontend already separates these before ever building the request.
+const YOUTUBE_HOST_PATTERN = /(youtube\.com|youtu\.be)/i;
+const LIST_PARAM_PATTERN = /[?&]list=[\w-]+/i;
+const MAX_BATCH_VIDEOS = 25;
 
-  if (
-    !youtubeUrl ||
-    typeof youtubeUrl !== "string" ||
-    youtubeUrl.length > MAX_YOUTUBE_URL_LENGTH ||
-    !YOUTUBE_URL_PATTERN.test(youtubeUrl)
-  ) {
-    return res.status(400).json({ error: "youtubeUrl must be a valid YouTube video URL" });
+// Language + style picker (see the frontend's new picker screen, inserted
+// between video selection and generation). Both are optional and apply
+// identically regardless of single-video/batch/playlist source - see
+// runPipeline's language/styleId params. Gemini/Groq handle all four of
+// these reasonably well (verified directly for Hindi - see README); the
+// allowlist exists so an unsupported value fails fast with a clear 400
+// instead of silently being passed through to the prompt as free text.
+const ALLOWED_LANGUAGES = ["English", "Hindi", "Tamil", "Bengali"];
+const ALLOWED_STYLE_IDS = Object.keys(STYLE_PRESETS);
+
+app.post("/generate", requireApiSecret, generateLimiter, (req, res) => {
+  const { youtubeUrl, transcript, transcriptSource, requestId, videoUrls, playlistUrl, language, styleId } = req.body ?? {};
+
+  const modesProvided = [youtubeUrl, videoUrls, playlistUrl].filter((v) => v !== undefined).length;
+  if (modesProvided !== 1) {
+    return res.status(400).json({ error: "Request must include exactly one of: youtubeUrl, videoUrls, playlistUrl" });
   }
+
+  if (youtubeUrl !== undefined) {
+    if (
+      typeof youtubeUrl !== "string" ||
+      youtubeUrl.length > MAX_YOUTUBE_URL_LENGTH ||
+      !YOUTUBE_URL_PATTERN.test(youtubeUrl)
+    ) {
+      return res.status(400).json({ error: "youtubeUrl must be a valid YouTube video URL" });
+    }
+  } else if (videoUrls !== undefined) {
+    if (!Array.isArray(videoUrls) || videoUrls.length === 0 || videoUrls.length > MAX_BATCH_VIDEOS) {
+      return res.status(400).json({ error: `videoUrls must be a non-empty array of at most ${MAX_BATCH_VIDEOS} YouTube video URLs` });
+    }
+    for (const entry of videoUrls) {
+      if (typeof entry !== "string" || entry.length > MAX_YOUTUBE_URL_LENGTH || !YOUTUBE_URL_PATTERN.test(entry)) {
+        return res.status(400).json({ error: "Each videoUrls entry must be a valid YouTube video URL" });
+      }
+      if (LIST_PARAM_PATTERN.test(entry)) {
+        return res.status(400).json({ error: "videoUrls entries must not include a playlist ?list= parameter - use playlistUrl instead" });
+      }
+    }
+  } else if (playlistUrl !== undefined) {
+    if (
+      typeof playlistUrl !== "string" ||
+      playlistUrl.length > MAX_YOUTUBE_URL_LENGTH ||
+      !YOUTUBE_HOST_PATTERN.test(playlistUrl) ||
+      !LIST_PARAM_PATTERN.test(playlistUrl)
+    ) {
+      return res.status(400).json({ error: "playlistUrl must be a valid YouTube URL containing a ?list= parameter" });
+    }
+  }
+
   if (transcript !== undefined) {
     if (typeof transcript !== "string" || transcript.length === 0 || transcript.length > MAX_TRANSCRIPT_LENGTH) {
       return res
@@ -187,6 +236,12 @@ app.post("/generate", requireApiSecret, generateLimiter, (req, res) => {
   if (requestId !== undefined && (typeof requestId !== "string" || requestId.length === 0 || requestId.length > MAX_REQUEST_ID_LENGTH)) {
     return res.status(400).json({ error: "requestId, if provided, must be a non-empty string" });
   }
+  if (language !== undefined && !ALLOWED_LANGUAGES.includes(language)) {
+    return res.status(400).json({ error: `language, if provided, must be one of: ${ALLOWED_LANGUAGES.join(", ")}` });
+  }
+  if (styleId !== undefined && !ALLOWED_STYLE_IDS.includes(styleId)) {
+    return res.status(400).json({ error: `styleId, if provided, must be one of: ${ALLOWED_STYLE_IDS.join(", ")}` });
+  }
   if (!process.env.GEMINI_API_KEY) {
     return res.status(500).json({ error: "GEMINI_API_KEY is not set on the server" });
   }
@@ -197,6 +252,31 @@ app.post("/generate", requireApiSecret, generateLimiter, (req, res) => {
     if (existing) {
       return res.status(202).json({ jobId: existing.jobId });
     }
+  }
+
+  // "Multiple videos" flow (see the mode-choice/multi-link frontend work) -
+  // resolves/fetches/merges via runPipeline's videoUrls/playlistUrl branch
+  // (src/pipeline.js), same as the single-video path below just with a
+  // different transcript-acquisition step. youtubeUrl is null here since
+  // it's unused in that branch.
+  if (videoUrls !== undefined || playlistUrl !== undefined) {
+    console.log("[generate] batch request received:", playlistUrl ? { playlistUrl } : { videoUrls });
+    const descriptor = playlistUrl ? `[playlist] ${playlistUrl}` : `[batch of ${videoUrls.length}] ${videoUrls.join(", ")}`;
+    const job = createJob(descriptor);
+    if (requestId) recentGenerateRequests.set(requestId, { jobId: job.id, createdAt: Date.now() });
+    const outputPath = path.join(JOBS_DIR, `${job.id}.pdf`);
+
+    runPipeline(null, outputPath, {
+      onUpdate: (patch) => updateJob(job.id, patch),
+      videoUrls,
+      playlistUrl,
+      language,
+      styleId,
+    }).catch((err) => {
+      console.error(`[job ${job.id}] failed:`, err.message);
+    });
+
+    return res.status(202).json({ jobId: job.id });
   }
 
   const job = createJob(youtubeUrl);
@@ -219,6 +299,8 @@ app.post("/generate", requireApiSecret, generateLimiter, (req, res) => {
   runPipeline(youtubeUrl, outputPath, {
     onUpdate: (patch) => updateJob(job.id, patch),
     preFetchedTranscript,
+    language,
+    styleId,
   }).catch((err) => {
     // runPipeline already records { stage: "error", error } via onUpdate
     // before rethrowing - this catch just stops the rejection from

@@ -46,8 +46,21 @@ const JSON_SHAPE_INSTRUCTIONS = `Respond with ONLY a raw JSON object - no markdo
 }
 "formula", "table", and "callout" are optional per section - use null or omit when not warranted, never force one in.`;
 
-function buildUserPrompt(transcript, title) {
-  return title ? `Lecture title hint: "${title}"\n\nTranscript:\n${transcript}` : `Transcript:\n${transcript}`;
+// English is the default/omitted case - no instruction added, so an old
+// request with no `language` field (or one explicitly set to "English")
+// behaves exactly as before this feature existed. Only a non-English
+// selection appends this. Explicit about the LaTeX boundary since
+// "translate everything" is exactly wrong for `\hat{i}`, `N_AB`, etc. -
+// those are syntax, not prose, and translating a variable name or command
+// would just break KaTeX rendering downstream (see template.js).
+function languageInstruction(language) {
+  if (!language || language === "English") return "";
+  return `\n\nIMPORTANT: Write the entire output - every title, subheading, bullet, callout, and table cell - in ${language}. Keep all LaTeX/math notation (formulas, inline $...$ math, commands like \\hat{i} or \\sin\\theta, subscripts, superscripts, variable names) exactly as valid LaTeX syntax - do not translate or transliterate anything inside math notation. Only the surrounding explanatory prose should be in ${language}, not English.`;
+}
+
+function buildUserPrompt(transcript, title, language) {
+  const base = title ? `Lecture title hint: "${title}"\n\nTranscript:\n${transcript}` : `Transcript:\n${transcript}`;
+  return base + languageInstruction(language);
 }
 
 function parseAndValidate(raw, providerLabel) {
@@ -80,7 +93,7 @@ function isQuotaError(err) {
   return /\b429\b|quota|rate.?limit|resource.?exhausted|too many requests/i.test(message);
 }
 
-async function generateWithGemini(transcript, title, modelName) {
+async function generateWithGemini(transcript, title, modelName, language) {
   const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
   const model = genAI.getGenerativeModel({
     model: modelName,
@@ -91,11 +104,11 @@ async function generateWithGemini(transcript, title, modelName) {
     },
   });
 
-  const result = await model.generateContent(buildUserPrompt(transcript, title));
+  const result = await model.generateContent(buildUserPrompt(transcript, title, language));
   return parseAndValidate(result.response.text(), modelName);
 }
 
-async function generateWithGroq(transcript, title) {
+async function generateWithGroq(transcript, title, language) {
   if (!process.env.GROQ_API_KEY) {
     throw new Error("GROQ_API_KEY is not set - cannot use Groq as a fallback provider.");
   }
@@ -105,7 +118,7 @@ async function generateWithGroq(transcript, title) {
     model: "llama-3.3-70b-versatile",
     messages: [
       { role: "system", content: `${SYSTEM_PROMPT}\n\n${JSON_SHAPE_INSTRUCTIONS}` },
-      { role: "user", content: buildUserPrompt(transcript, title) },
+      { role: "user", content: buildUserPrompt(transcript, title, language) },
     ],
     response_format: { type: "json_object" },
   });
@@ -132,11 +145,14 @@ async function generateWithGroq(transcript, title) {
  *    JSON_SHAPE_INSTRUCTIONS in the prompt plus the same zod validation
  *    every provider's output goes through either way.
  */
-export async function generateNotes(transcript, { title } = {}) {
+export async function generateNotes(transcript, { title, language } = {}) {
   const providers = [
-    { label: process.env.GEMINI_MODEL || "gemini-2.5-flash", run: () => generateWithGemini(transcript, title, process.env.GEMINI_MODEL || "gemini-2.5-flash") },
-    { label: "gemini-2.5-flash-lite", run: () => generateWithGemini(transcript, title, "gemini-2.5-flash-lite") },
-    { label: "groq-llama-3.3-70b", run: () => generateWithGroq(transcript, title) },
+    {
+      label: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+      run: () => generateWithGemini(transcript, title, process.env.GEMINI_MODEL || "gemini-2.5-flash", language),
+    },
+    { label: "gemini-2.5-flash-lite", run: () => generateWithGemini(transcript, title, "gemini-2.5-flash-lite", language) },
+    { label: "groq-llama-3.3-70b", run: () => generateWithGroq(transcript, title, language) },
   ];
 
   for (let i = 0; i < providers.length; i++) {

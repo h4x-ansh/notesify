@@ -32,6 +32,62 @@ const DOODLE_ICONS = [
   `<path d="M5 13l4 4L19 7"/>`,
 ];
 
+/**
+ * Visual theme presets - CSS variable swaps in the existing template
+ * (below), not separate templates. `classic` reproduces the original
+ * hardcoded colors exactly (same hex values, same yellow-500 badge, same
+ * highlight rgba) - a request with no `styleId` (every request before this
+ * feature existed, and every provider fallback path) must render byte-
+ * identical output to before this change, not just "a reasonable default."
+ * Callout colors (Exam Tip/Common Mistake/etc., see CALLOUT_STYLE below)
+ * are deliberately NOT themed - they carry meaning (red for a mistake,
+ * green for a memory trick) that shouldn't shift with a color palette
+ * choice, so they're constant across all three presets.
+ */
+export const STYLE_PRESETS = {
+  classic: {
+    label: "Classic Topper",
+    inkColor: "#103f91",
+    markerColor: "#be123c",
+    paperBg: "#faf7eb",
+    highlightRgb: "254, 240, 138",
+    doodleColor: "#3b82f6",
+    doodleOpacity: "0.85",
+    badgeColor: "#eab308",
+    katexColor: "#0c4a6e",
+  },
+  coolTones: {
+    label: "Cool Tones",
+    inkColor: "#3b0764",
+    markerColor: "#0f766e",
+    paperBg: "#f2f6fa",
+    highlightRgb: "165, 243, 252",
+    doodleColor: "#0891b2",
+    doodleOpacity: "0.85",
+    // Kept light (teal-300, not the deep purple/teal used for ink/marker)
+    // so the existing dark badge text (text-slate-900, unthemed - see
+    // renderNotesHtml) stays readable. The badge is a highlighter-style
+    // label, same idea as .highlight - it should read as "light background,
+    // dark text" in every theme, not flip to a dark badge with unreadable
+    // dark-on-dark text.
+    badgeColor: "#5eead4",
+    katexColor: "#155e75",
+  },
+  minimal: {
+    label: "Minimal",
+    inkColor: "#1f2937",
+    markerColor: "#374151",
+    paperBg: "#ffffff",
+    highlightRgb: "226, 232, 240",
+    doodleColor: "#9ca3af",
+    doodleOpacity: "0.25",
+    badgeColor: "#e5e7eb",
+    katexColor: "#111827",
+  },
+};
+
+const DEFAULT_STYLE_ID = "classic";
+
 const CALLOUT_STYLE = {
   "Exam Tip": { bg: "bg-yellow-100/60", border: "border-yellow-500", badge: "bg-amber-600", label: "⚡ Topper's Exam Tip" },
   "Common Mistake": { bg: "bg-red-50/50", border: "border-red-500", badge: "bg-rose-600", label: "⚠️ Common Mistake" },
@@ -233,7 +289,16 @@ function renderPage(page, index, subject) {
     </div>`;
 }
 
-export function renderNotesHtml(notes) {
+/**
+ * `styleId` selects a preset from STYLE_PRESETS above (falls back to
+ * `classic` for an unknown/missing id - the same fallback whether the
+ * field was never sent at all, pre-dating this feature, or a client sent
+ * something invalid; both degrade to today's output rather than erroring).
+ * Every color in the stylesheet below now reads from `theme` instead of a
+ * literal hex/rgba value - a CSS variable swap, not a second template.
+ */
+export function renderNotesHtml(notes, { styleId } = {}) {
+  const theme = STYLE_PRESETS[styleId] || STYLE_PRESETS[DEFAULT_STYLE_ID];
   const pagesHtml = notes.pages.map((page, i) => renderPage(page, i, notes.subject)).join("\n");
 
   return `<!DOCTYPE html>
@@ -251,11 +316,16 @@ export function renderNotesHtml(notes) {
   <style>${TAILWIND_CSS}</style>
   <style>
     :root {
-      --blue-ink: #103f91;
-      --red-marker: #be123c;
-      --paper-bg: #faf7eb;
+      --blue-ink: ${theme.inkColor};
+      --red-marker: ${theme.markerColor};
+      --paper-bg: ${theme.paperBg};
+      --highlight-rgb: ${theme.highlightRgb};
+      --doodle-color: ${theme.doodleColor};
+      --doodle-opacity: ${theme.doodleOpacity};
+      --badge-color: ${theme.badgeColor};
+      --katex-color: ${theme.katexColor};
     }
-    body { background-color: #faf7eb; }
+    body { background-color: var(--paper-bg); }
     .handwritten { font-family: 'Kalam', cursive; font-weight: 400; color: var(--blue-ink); line-height: 1.7; }
     .marker-heading { font-family: 'Caveat', cursive; font-weight: 700; color: var(--red-marker); letter-spacing: -0.5px; transform: rotate(-0.5deg); display: inline-block; }
     .marker-title { font-family: 'Permanent Marker', cursive; color: var(--red-marker); transform: rotate(-1.5deg); }
@@ -264,12 +334,13 @@ export function renderNotesHtml(notes) {
     .margin-line { position: absolute; top: 0; bottom: 0; left: 65px; width: 2px; background-color: rgba(239,68,68,0.4); z-index: 10; }
     .spiral-binding { position: absolute; left: -20px; top: 40px; bottom: 40px; display: flex; flex-direction: column; justify-content: space-around; z-index: 50; height: 90%; }
     .spiral-ring { width: 45px; height: 18px; background: linear-gradient(90deg, #94a3b8 0%, #cbd5e1 30%, #f1f5f9 60%, #64748b 100%); border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); margin-bottom: 25px; transform: rotate(-4deg); }
-    .highlight { background: linear-gradient(104deg, rgba(254,240,138,0.8) 0.9%, rgba(254,240,138,0.95) 2.4%, rgba(254,240,138,0.7) 5.8%, rgba(254,240,138,0.3) 93%, rgba(254,240,138,0.85) 96%, rgba(254,240,138,0.5) 98%); border-radius: 4px 15px 4px 12px; padding: 0 4px; }
+    .highlight { background: linear-gradient(104deg, rgba(var(--highlight-rgb),0.8) 0.9%, rgba(var(--highlight-rgb),0.95) 2.4%, rgba(var(--highlight-rgb),0.7) 5.8%, rgba(var(--highlight-rgb),0.3) 93%, rgba(var(--highlight-rgb),0.85) 96%, rgba(var(--highlight-rgb),0.5) 98%); border-radius: 4px 15px 4px 12px; padding: 0 4px; }
     .callout-badge { font-family: 'Permanent Marker', cursive; font-size: 0.7rem; letter-spacing: 0.5px; padding: 4px 8px; border-radius: 4px; transform: rotate(-2deg); box-shadow: 2px 2px 5px rgba(0,0,0,0.15); }
     .scan-artifact-noise { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; opacity: 0.12; mix-blend-mode: multiply; background-image: url("${NOISE_TEXTURE_DATA_URI}"); background-repeat: repeat; background-size: 200px 200px; z-index: 40; }
     .shadow-vignette { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; box-shadow: inset 0 0 80px rgba(0,0,0,0.1); z-index: 42; border-radius: 4px; }
-    .doodle { color: #3b82f6; opacity: 0.85; transform: rotate(-5deg); }
-    .katex { font-size: 1.05em !important; color: #0c4a6e; }
+    .doodle { color: var(--doodle-color); opacity: var(--doodle-opacity); transform: rotate(-5deg); }
+    .katex { font-size: 1.05em !important; color: var(--katex-color); }
+    .subject-badge { background-color: var(--badge-color); }
     .notebook-page { break-after: page; }
     .notebook-page:last-child { break-after: auto; }
     @media print {
@@ -281,7 +352,7 @@ export function renderNotesHtml(notes) {
 <body class="py-8 px-2 md:px-4 text-slate-800">
   <div id="notebook-container" class="max-w-4xl mx-auto space-y-12 relative">
     <div class="text-center mb-6">
-      <div class="inline-block bg-yellow-500 text-slate-900 text-xs font-bold uppercase py-1 px-2 rotate-[-8deg] shadow-md mb-2">
+      <div class="subject-badge inline-block text-slate-900 text-xs font-bold uppercase py-1 px-2 rotate-[-8deg] shadow-md mb-2">
         ${notes.subject ? escapeHtml(notes.subject) : "Topper Notes"} 📚
       </div>
       <h1 class="marker-title text-4xl md:text-5xl tracking-wide">${escapeHtml(notes.title)}</h1>

@@ -46,6 +46,12 @@ export interface StatusResponse {
   transcriptLength?: number;
   notesTitle?: string;
   pageCount?: number;
+  // "Multiple videos" flow only (see src/pipeline.js's batch path) - a
+  // human-readable per-video status ("Fetching video 2 of 4...") during
+  // extracting_transcript, and any videos that failed and were skipped
+  // rather than failing the whole batch, each with why.
+  batchProgress?: string;
+  skippedVideos?: { url: string; title: string; reason: string }[];
 }
 
 export class ApiError extends Error {
@@ -156,9 +162,68 @@ export async function checkHealth(timeoutMs = 3000): Promise<boolean> {
  * server.js's idempotency cache return the original job on a retry instead
  * of creating a second one. See the matching comment in server.js.
  */
+/** English is the omitted/default case - see notesGenerator.js, it's a no-op there too. */
+export const SUPPORTED_LANGUAGES = ["English", "Hindi", "Tamil", "Bengali"] as const;
+export type Language = (typeof SUPPORTED_LANGUAGES)[number];
+
+export interface StylePreset {
+  id: string;
+  label: string;
+}
+
+// Keep in sync with src/template.js's STYLE_PRESETS keys/labels - small,
+// stable list (3 items), not worth cross-language shared-config infra for.
+// `classic` first/default matches template.js's own DEFAULT_STYLE_ID.
+export const STYLE_PRESETS: StylePreset[] = [
+  { id: "classic", label: "Classic Topper" },
+  { id: "coolTones", label: "Cool Tones" },
+  { id: "minimal", label: "Minimal" },
+];
+
+/** Both optional - omitted entirely (not even sent as empty strings) falls back to English/classic server-side, see server.js and template.js. */
+export interface LanguageStyleOptions {
+  language?: string;
+  styleId?: string;
+}
+
+function languageStyleFields({ language, styleId }: LanguageStyleOptions = {}) {
+  return {
+    ...(language && language !== "English" ? { language } : {}),
+    ...(styleId && styleId !== "classic" ? { styleId } : {}),
+  };
+}
+
+/**
+ * `clientTranscript`, when present, was already fetched client-side (see
+ * lib/transcript.ts) - the server skips its own captions/yt-dlp attempt
+ * entirely and goes straight to notes generation. Omit it (or pass null,
+ * e.g. the client-side fetch failed) to get the old behavior: the server
+ * tries on its own, still falling back to yt-dlp/Whisper as before.
+ *
+ * A network-level failure here is genuinely ambiguous - the request could
+ * have already reached Express and created a job before the connection
+ * dropped, so a blind retry risks double-submitting. That risk turned out
+ * to matter more than it first looked: Render's no-server edge-proxy 404
+ * (the specific case fetchWithRetry's no-server branch was written to
+ * handle) ships with no CORS headers of its own at all, so from inside a
+ * real browser it never actually reaches that branch - fetch() throws an
+ * opaque network error before JS can inspect status/headers, landing in
+ * the *generic* network-error path instead (confirmed by testing the
+ * literal no-server response shape through Puppeteer, not assumed).
+ * Meaning: without something to make retry provably safe, the most common
+ * real failure this is meant to recover from would still have to be
+ * treated as unsafe-to-retry.
+ *
+ * `requestId` is that something - generated once per logical submit
+ * attempt and reused unchanged across every retry of that attempt (it's
+ * computed here, before fetchWithRetry's loop, not inside it), it lets
+ * server.js's idempotency cache return the original job on a retry instead
+ * of creating a second one. See the matching comment in server.js.
+ */
 export async function generateNotes(
   youtubeUrl: string,
-  clientTranscript?: { text: string; source: string } | null
+  clientTranscript?: { text: string; source: string } | null,
+  options?: LanguageStyleOptions
 ): Promise<{ jobId: string }> {
   const requestId = crypto.randomUUID();
   let res: Response;
@@ -172,7 +237,35 @@ export async function generateNotes(
         ...(clientTranscript
           ? { transcript: clientTranscript.text, transcriptSource: clientTranscript.source }
           : {}),
+        ...languageStyleFields(options),
       }),
+    });
+  } catch {
+    throw new ApiError("Can't reach the server. Is it running?");
+  }
+  if (!res.ok) throw new ApiError(await parseErrorBody(res), res.status);
+  return res.json();
+}
+
+/**
+ * The "multiple videos" flow's request shape (see components/MultiLinkInput.tsx) -
+ * either a batch of individually-pasted video links, or a single playlist
+ * link standing in for its entire contents. Mutually exclusive with
+ * `youtubeUrl`/generateNotes above, and with each other - the UI only ever
+ * builds one or the other, never both. Runs through the same real
+ * resolve/fetch/merge pipeline as a single video, just with N transcripts
+ * instead of one - see src/pipeline.js.
+ */
+export type BatchPayload = { videoUrls: string[] } | { playlistUrl: string };
+
+export async function generateNotesBatch(payload: BatchPayload, options?: LanguageStyleOptions): Promise<{ jobId: string }> {
+  const requestId = crypto.randomUUID();
+  let res: Response;
+  try {
+    res = await fetchWithRetry(`${API_BASE_URL}/generate`, {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ ...payload, requestId, ...languageStyleFields(options) }),
     });
   } catch {
     throw new ApiError("Can't reach the server. Is it running?");

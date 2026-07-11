@@ -230,6 +230,16 @@ schema without re-calling Gemini.
 The audio-transcription fallback (only triggered when a video has no
 captions) additionally needs `yt-dlp` on `PATH` and `OPENAI_API_KEY` set.
 
+`yt-dlp` on `PATH` is no longer purely optional once the "multiple videos"
+flow is used, though - playlist resolution and per-video title lookups
+(`src/playlist.js`) both need it regardless of whether any video actually
+falls back to audio transcription. Missing `yt-dlp` fails a `playlistUrl`
+request outright (nothing to resolve without it) but only degrades a
+`videoUrls[]` batch gracefully (titles fall back to the raw URL as a
+label). Confirmed locally by installing `yt-dlp` via `pip install --user
+yt-dlp` (not present on this machine by default) before any of the
+verification below could run.
+
 `npm install` runs `build:css` automatically. If you add/remove Tailwind
 classes in `template.js`, re-run `npm run build:css` manually to refresh
 `src/templates/styles.css` before generating notes.
@@ -970,3 +980,239 @@ Full end-to-end regression re-run after all of the above, with default
 (unmodified) production rate limits: a real video, real captions, real
 Gemini call, real PDF render, reaching `done` in ~12s with `errorCode: null`
 on the success path - confirming none of this broke the actual pipeline.
+
+## Single vs. multiple videos
+
+A new first screen (`mode-choice`) sits in front of the existing URL-input
+flow: "Single video" or "Multiple videos." **Single video leads to the
+exact same screen as before, untouched** - `resetToStart()` was the only
+thing renamed (from `resetToInput()`, since "Try again"/"Generate another"
+now return to the mode choice rather than assuming last session's mode),
+and the input screen's own JSX/`handleSubmit`/validation are unmodified
+line for line.
+
+**Multiple videos** leads to `components/MultiLinkInput.tsx`, a new
+self-contained screen: one field to start, each field independently
+classified as it's typed into (`classifyLink` - reuses `looksLikeYoutubeUrl`
+from `lib/api.ts` rather than duplicating that pattern). A playlist link
+(`youtube.com`/`youtu.be` with a `?list=` param - including a "watch a
+video that's part of a playlist" URL, which would otherwise also match the
+single-video pattern, so playlist detection is checked first) locks the
+screen to a single "Next" button - a playlist already contains many
+videos, so it's treated as the complete batch on its own. A single-video
+link instead reveals "Add more" (appends a new empty field, itself
+independently classified) and "Next," building up a `videoUrls` array. An
+unrecognized non-empty value shows an inline error under that specific
+field and disables both buttons until it's fixed - never a silent block.
+
+**Request shape**: `POST /generate` now accepts `youtubeUrl` (unchanged),
+`videoUrls: string[]`, or `playlistUrl: string` - `server.js` requires
+exactly one of the three. Both new shapes get the same validation rigor as
+`youtubeUrl` always has (pattern/length checks, a `videoUrls` entry
+explicitly rejected if it carries a `?list=` param - that should have been
+sent as `playlistUrl` instead, defense in depth against a mismatched
+request even though the frontend already separates these before ever
+building one).
+
+**The stub, and why it responds instead of hanging or 404ing**: resolving
+multiple transcripts into one set of notes is real pipeline work, explicitly
+out of scope for this task ("a later step, not this one"). `server.js`
+still accepts a valid batch request, logs exactly what it received
+(`console.log`, videoUrls/playlistUrl - visible server-side, not silently
+dropped), creates a real job, and immediately marks it with a clear
+`errorCode: "not_implemented"` and a message saying so - rather than either
+pretending to succeed or leaving the frontend's progress view spinning
+forever against a job that will never advance. The existing generic
+error/progress/done views (unmodified) render this exactly like any other
+job failure - confirmed by watching a submitted playlist job resolve to
+the real "Generation failed" screen with that exact message, "Try again"
+included.
+
+**Verified end to end through the real UI** (a live backend, a live
+frontend build, Puppeteer driving actual clicks/typing - not just "it
+compiles"), each as a distinct run with the actual `/generate` request
+body captured and asserted on, not inferred from the UI alone:
+- Mode-choice screen reached first, both buttons present. "Single video" →
+  the real existing input screen → submitted a real video → request body
+  confirmed as `{"youtubeUrl": "...", "requestId": "..."}`, no new fields
+  - i.e. genuinely indistinguishable from before this task.
+- "Multiple videos" → pasted a playlist link → confirmed "Add more"
+  disappears, only "Next" remains → clicked it → request body confirmed as
+  `{"playlistUrl": "...", "requestId": "..."}` only.
+- "Multiple videos" → pasted a single video link → "Add more" appeared →
+  used it twice to reach 3 fields, each independently filled with a valid
+  link → confirmed the request body's `videoUrls` array contained exactly
+  those 3 URLs, with no `youtubeUrl`/`playlistUrl` present.
+- Pasted a non-YouTube URL → confirmed the inline "That doesn't look like a
+  YouTube link" error appears and both "Add more" and "Next" are disabled
+  (checked their actual `disabled` DOM property, not just visual styling).
+- Screenshotted each state (mode-choice, the 3-field batch, the disabled
+  invalid state) and visually confirmed they match the design language of
+  the rest of the app - not just that the assertions passed.
+
+**Explicitly out of scope, per the task**: the language/style picker (not
+built yet), the single-video flow's own internals, and any real
+multi-video pipeline logic beyond accepting and logging the new shapes.
+
+## Real multi-video/playlist pipeline
+
+The `not_implemented` stub above is gone - `videoUrls`/`playlistUrl` now
+run through a real batch path in `src/pipeline.js`, not a preview.
+
+**Playlist resolution** (`src/playlist.js`, new): `yt-dlp --flat-playlist
+--print id <url>` lists a playlist's video IDs without visiting each video
+page (fast regardless of playlist length), reconstructed into watch URLs
+locally rather than trusting yt-dlp's own `--print url` output format
+(varies by version - `--print id` is unambiguous). Capped at 20 videos
+(`MAX_PLAYLIST_VIDEOS`), enforced *after* resolution since the real count
+isn't known until yt-dlp reports it - a caller pointing at an oversized
+playlist gets a clear rejection naming the actual count and the limit, not
+a silent truncation to the first 20.
+
+**Per-video title lookup**, also via yt-dlp (`--skip-download --print
+"%(title)s"` - no video is downloaded for either this or playlist listing),
+labels each video's section in the merged transcript and identifies a
+skipped video in job metadata. Best-effort and non-fatal: a broken/missing
+yt-dlp falls back to using the URL itself as the label rather than failing
+the whole batch over what's ultimately cosmetic.
+
+**Fetch + merge** (`fetchAndMergeTranscripts`/`mergeTranscripts` in
+`pipeline.js`): each video's transcript still goes through the exact same
+`getTranscript()` as a single-video job - same captions-then-yt-dlp/Whisper
+fallback, unchanged. Per-video progress reports as `batchProgress`
+("Fetching video 2 of 4...") in job metadata, spread across the same 5-25%
+range a single video's `extracting_transcript` already used, so the overall
+stage progression doesn't change shape for a batch. **Skip policy**: one
+bad video doesn't fail the whole batch - it's recorded with its reason and
+excluded from the merge, only failing outright if *every* video in the
+batch fails. Skips surface as `skippedVideos` in job metadata (URL, title,
+reason) - the frontend's `done` view lists them - never silently dropped.
+Successful transcripts are joined with a `--- Video N: [title] ---` marker
+each, so Gemini sees clear boundaries between unrelated lecture content
+instead of one undifferentiated wall of text.
+
+**Error messages stay specific, not generic** - `src/errors.js` gained a
+`PipelineError` class for messages this codebase authors itself (playlist
+too large, couldn't resolve a playlist, every video failed): these are
+already safe to show a client verbatim (no SDK/provider text to leak), so
+`classifyError` passes them through directly instead of flattening them
+into the generic "Something went wrong" reserved for actually-unsafe
+provider errors.
+
+**Verified with real videos, a real playlist, and a real forced failure -
+not mocks:**
+- **2-video `videoUrls[]` batch** ("Me at the zoo" + a music video):
+  completed real end to end, `batchProgress` correctly showed "video 1 of
+  2" then "2 of 2", `transcriptSource: "batch-merged"`,
+  `transcriptLength: 2425` (consistent with both individual transcript
+  lengths plus markers). **Downloaded the actual PDF and read it** - it
+  contains two clearly separate sections, "Elephants: Observed Physical
+  Characteristics" and "Rick Astley - Never Gonna Give You Up: Content
+  Analysis" - genuinely organized as distinct topics, not blended
+  together. This is the one that matters most (confirms the merge actually
+  works, not just that the request shape is accepted).
+- **Real playlist** (a public 13-video ML conference playlist):
+  `resolvePlaylistVideoUrls` resolved all 13 real video IDs; ran the full
+  batch through the real server - `batchProgress` correctly incremented
+  through all 13, merged transcript landed at 264,440 characters, and the
+  job completed with `notesTitle: "Pittsburgh ML Summit '19 - Lecture
+  Notes"` and `pageCount: 26` - a title that itself reflects the merge
+  correctly recognized a multi-talk event, not one video's title
+  arbitrarily standing in for the whole batch. The Gemini call on a
+  transcript this large took several minutes (not stuck - no error in the
+  server log the whole time, and it did complete) - noting this as a real,
+  observed characteristic of large batches, not asserting a false "it's
+  instant." Downloaded the resulting 14.5MB/26-page PDF; wasn't able to
+  visually re-render *this specific* PDF in this environment (missing
+  `poppler-utils`, an infra gap in this session, not the app), so multi-
+  section coverage for this one is inferred from the strong structural
+  evidence above rather than re-confirmed page by page - the actual
+  section-separation *mechanism* is the same code path already directly
+  visually verified via the smaller 2-video test.
+- **Isolated playlist-resolution checks**: fed the same real 13-video
+  playlist through `resolvePlaylistVideoUrls` directly with
+  `maxVideos: 5` - correctly rejected with `"This playlist has 13 videos,
+  over the 5-video limit..."` and `errorCode: "playlist_too_large"`, not a
+  silent truncation to 5. With `maxVideos: 20`, correctly resolved all 13
+  real, correctly-ordered watch URLs.
+- **Deliberate partial failure**: a 3-video batch with one syntactically-
+  valid-but-nonexistent video ID (`ZZZZZZZZZZZ`) mixed in with two real
+  ones. The batch **completed successfully** (`stage: "done"`) rather than
+  failing outright - `skippedVideos` correctly listed the fake video's URL
+  and the exact reason ("No captions available for this video.
+  Audio-transcription fallback requires OPENAI_API_KEY to be set."), and
+  `transcriptLength: 2425` confirmed only the two real videos' transcripts
+  were actually merged in, not a corrupted three-way merge.
+
+## Language + style picker
+
+Between video selection and pipeline start, both the single-video and
+multi-video/playlist flows now land on a new picker screen
+(`LanguageStylePicker.tsx`) instead of firing `/generate` immediately -
+notes language and visual theme are chosen there, then "Generate Notes"
+kicks off the pipeline with both included in the request.
+
+**Language** (`ALLOWED_LANGUAGES` in `server.js`): English (default),
+Hindi, Tamil, Bengali - Hindi listed first per the most-requested language
+for Indian exam-prep audiences. `notesGenerator.js`'s
+`languageInstruction()` appends a targeted instruction to the Gemini/Groq
+prompt when a non-English language is selected: translate all prose
+(titles, headings, bullets, callouts, table cells) but leave LaTeX/math
+notation untouched, since transliterating `\hat{i}` or `\sin\theta` would
+break rendering. English (the default) sends no extra instruction at all,
+so the old prompt shape is unchanged for the common case.
+
+**Style** (`STYLE_PRESETS` in `template.js`): three presets - `classic`
+(the original blue-ink/red-marker/yellow-highlight scheme, now the
+explicit default rather than the only option), `coolTones`
+(purple ink/teal marker/cyan highlight), and `minimal` (near-black ink,
+white paper, low-opacity doodles, muted gray accents). Implemented as a
+CSS-custom-property swap, not separate templates:
+`renderNotesHtml(notes, { styleId })` resolves the preset and injects its
+tokens (`--ink-color`, `--marker-color`, `--paper-bg`, `--highlight-rgb`,
+`--doodle-color`, `--doodle-opacity`, `--badge-color`, `--katex-color`)
+into `:root`, and every previously-hardcoded color reference in the
+template now reads from a `var(--...)` instead. Callout colors
+(mistake/memory-trick highlight boxes) are deliberately left unthemed -
+they're semantic (red/green), not decorative.
+
+Both fields are optional and validated against allowlists (`400` on an
+unrecognized value); omitting either falls back to English/`classic`,
+so requests using the old shape (no `language`/`styleId` at all) behave
+exactly as before this feature existed.
+
+**Verified with real Gemini calls, a real Puppeteer UI walkthrough, and
+real downloaded PDFs - not mocks:**
+- **Single-video path, Hindi + Cool Tones**: drove the actual browser
+  through mode-choice -> single-video input -> picker -> "Generate Notes",
+  confirming zero `/generate` requests fired until the picker's own button
+  was clicked. The request body carried `language: "Hindi"`,
+  `styleId: "coolTones"`. Downloaded and read the resulting PDF - genuine
+  Hindi body content throughout, not just labels/headers (title, subject
+  badge, headings, and bullets all in actual Hindi prose), rendered in the
+  Cool Tones purple/teal scheme, visually distinct from Classic.
+- **Multi-video path, English (default) + Minimal**: drove the actual
+  browser through mode-choice -> "Multiple videos" -> `MultiLinkInput` ->
+  picker -> "Generate Notes", confirming the picker gates the batch path
+  the same way. Request body was
+  `{"videoUrls":[...], "styleId":"minimal"}` - no `language` field at all,
+  since `frontend/lib/api.ts`'s `languageStyleFields()` omits English
+  (the default) rather than sending it explicitly. Downloaded and read the
+  resulting PDF - near-black ink on plain white paper, muted gray badge,
+  subtle gray highlight, no visible doodle clutter - genuinely distinct
+  from both Classic and Cool Tones, not just a config flag with no visible
+  effect.
+- **Backward compatibility, live server**: `POST /generate` with only
+  `youtubeUrl`/`requestId` (no `language`/`styleId` fields at all, the old
+  request shape) - completed with no validation errors
+  (`stage: "done"`, `pageCount: 1`). Downloaded and read the resulting
+  PDF - Classic scheme (blue ink, red-marker headings, yellow highlight,
+  cream paper, yellow badge) and English content, confirming the new
+  fields being fully absent from the request produces the same visual
+  behavior as before this feature shipped. This complements an earlier
+  isolated check that `renderNotesHtml(notes)` (no options argument at
+  all - the pre-feature call signature) produces HTML identical to
+  `renderNotesHtml(notes, { styleId: "classic" })`.
+- **Invalid values rejected**: `language: "Klingon"` and `styleId: "neon"`
+  each independently produced a `400` naming the allowlist, confirming
+  the validation isn't just decorative.

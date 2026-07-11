@@ -1,4 +1,22 @@
 /**
+ * For errors this codebase authors itself - a clear message already
+ * written for an end user (playlist too large, couldn't resolve a
+ * playlist, every video in a batch failed) - rather than one bubbled up
+ * from an SDK/provider. classifyError below passes these through verbatim
+ * instead of running them through the regex classification meant for
+ * *unsafe* (possibly leaky) provider errors, so a specific, useful message
+ * doesn't get flattened into "Something went wrong."
+ */
+export class PipelineError extends Error {
+  constructor(message, code = "pipeline_error") {
+    super(message);
+    this.name = "PipelineError";
+    this.code = code;
+    this.safe = true;
+  }
+}
+
+/**
  * Classifies a raw pipeline error (which may contain a Gemini/Groq SDK
  * error message - internal URLs, quota metric names, model IDs - or a zod
  * validation dump with schema paths) into a small, stable set of codes plus
@@ -9,6 +27,10 @@
  * pipeline.js's error handling for where this is actually applied.
  */
 export function classifyError(err) {
+  if (err?.safe) {
+    return { code: err.code || "pipeline_error", message: err.message };
+  }
+
   const raw = err?.message || String(err);
 
   if (/\b429\b|quota|rate.?limit|resource.?exhausted|too many requests/i.test(raw)) {
