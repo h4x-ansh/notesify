@@ -476,6 +476,78 @@ designed) would sidestep this rather than paying for a shared quota - and
 is worth remembering before assuming a `429` here means something is
 broken.
 
+## Multi-provider fallback for notes generation
+
+The Gemini daily-quota constraint above wasn't hypothetical - it interrupted
+this project's own testing repeatedly. `src/notesGenerator.js` now falls
+through a provider chain instead of hard-failing the moment Gemini's quota
+is hit:
+
+1. **`gemini-2.5-flash`** (`GEMINI_MODEL` overridable) - current primary,
+   best quality.
+2. **`gemini-2.5-flash-lite`** - same `GEMINI_API_KEY`/Google account, but a
+   separate ~1,000 RPD quota bucket from `-flash`'s ~20 RPD, and the same
+   native `responseSchema` constraining - a same-family model-string swap,
+   not a different integration.
+3. **Groq's `llama-3.3-70b-versatile`** (`GROQ_API_KEY`, free at
+   [console.groq.com/keys](https://console.groq.com/keys)) - a genuinely
+   separate provider/account, ~14,400 RPD free-tier headroom. Different
+   model family with no native JSON-schema constraining on Groq's side, so
+   the prompt spells out the exact shape explicitly
+   (`JSON_SHAPE_INSTRUCTIONS`) on top of `response_format: json_object`
+   (valid-JSON-guaranteed, not shape-guaranteed) - the same zod
+   (`NotesSchema`) validation every provider's output goes through either
+   way is still the real gate, not the prompt wording.
+
+**Only advances on a quota error, specifically** - `isQuotaError()` checks
+for a `429` status, `groq-sdk`'s typed `RateLimitError`, or
+quota/rate-limit wording in the error message. Anything else (malformed
+transcript, a provider's JSON failing the zod schema, a genuine 5xx, auth
+errors) fails immediately instead of silently masking a real problem behind
+more (doomed) attempts - a different provider wouldn't fix a schema
+mismatch or a bad API key either.
+
+**Which provider actually answered is always logged** - `console.log`
+on any fallback, so a job that succeeded via Groq is never silently
+indistinguishable from one that succeeded via Gemini.
+
+**If all three are exhausted/failing**, the error surfaced to the job (and
+therefore `/status`) is `"All note-generation providers are currently
+rate-limited. Try again later."` - not the old generic per-provider 429
+message, and not conflated with the "no captions" family of errors from
+the transcript stage.
+
+**Verified without burning real quota or needing a real `GROQ_API_KEY`**:
+monkeypatched `fetch` to return actual-shaped 429 responses from Gemini's
+API and a mocked (but response-shape-accurate) success from Groq's
+OpenAI-compatible endpoint, run through the real `generateNotes()` - not a
+reimplementation of the logic under test. Confirmed, each as a distinct
+scenario:
+- Real `gemini-2.5-flash` call against a real transcript still produces
+  valid, schema-passing notes (the actual point of "don't break the
+  common case" - checked first, before any fallback-path testing).
+- Forced 429 on both Gemini steps → chain correctly falls through to Groq,
+  Groq's mocked response is used, and the fallback is logged.
+- Forced 429 on all three → the exact terminal error message above, not a
+  per-provider 429 leaking through.
+- A non-quota error (mocked `500`) on the primary provider → fails
+  immediately, Groq is never even attempted (asserted directly, not just
+  inferred from the outcome).
+- A schema-shape mismatch (valid HTTP 200, but the model's JSON is missing
+  required fields) on the primary provider → also fails immediately, not
+  treated as a quota problem - confirms `isQuotaError()` doesn't
+  over-match.
+
+**Not verified**: the real Groq API. No `GROQ_API_KEY` was available in
+this environment to test against - console.groq.com requires signing up
+for an account, which wasn't done here. The mocked test above matches
+Groq's documented OpenAI-compatible response shape closely, but hasn't
+been checked against what Llama 3.3 70B actually returns for a real
+transcript - specifically whether its JSON/LaTeX output needs prompt
+adjustments beyond what `JSON_SHAPE_INSTRUCTIONS` already spells out. Set
+a real `GROQ_API_KEY` and either force a fake Gemini 429 (as above) or
+wait for real quota exhaustion to see it in practice.
+
 ## Mobile app (Capacitor/Android)
 
 The same frontend codebase is wrapped a third way: `frontend/capacitor.config.ts`

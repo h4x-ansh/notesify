@@ -2,7 +2,7 @@
 # only - the frontend/ and electron/ trees are excluded via .dockerignore
 # and aren't part of this service.
 #
-# Secrets (GEMINI_API_KEY, OPENAI_API_KEY, API_SHARED_SECRET,
+# Secrets (GEMINI_API_KEY, GROQ_API_KEY, OPENAI_API_KEY, API_SHARED_SECRET,
 # YT_COOKIES_BASE64) are intentionally left as `sync: false` - Render will
 # prompt for their values in the dashboard on first deploy rather than
 # reading them from this committed file.
@@ -18,6 +18,14 @@ services:
         sync: false
       - key: GEMINI_MODEL
         value: gemini-2.5-flash
+      # Third step of the notes-generation fallback chain (gemini-2.5-flash
+      # -> gemini-2.5-flash-lite -> Groq), only reached once both Gemini
+      # quotas are exhausted (see src/notesGenerator.js). Free key at
+      # console.groq.com/keys - the free tier's daily Gemini cap is hit
+      # often enough on this project's own hosted testing that this isn't
+      # just a theoretical fallback.
+      - key: GROQ_API_KEY
+        sync: false
       - key: OPENAI_API_KEY
         sync: false
       # Required on /generate, /status/:jobId, /download/:jobId via

@@ -1,4 +1,5 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import Groq from "groq-sdk";
 import { NotesSchema, geminiNotesSchema } from "./schema.js";
 
 const SYSTEM_PROMPT = `You are a meticulous note-taker for exam aspirants.
@@ -16,11 +17,73 @@ Rules:
 - Paginate: group 2-4 related sections per page so no page is overloaded. Prefer more pages over cramming.
 - If the transcript is ambiguous or garbled in a spot, note it plainly rather than guessing at content.`;
 
-export async function generateNotes(transcript, { title } = {}) {
-  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Gemini gets schema-constrained output natively (generationConfig.responseSchema
+// below), so it doesn't need this spelled out in prose. Groq's OpenAI-compatible
+// API only guarantees *valid JSON* via response_format: json_object, not
+// adherence to a particular shape - without this, nothing stops it from
+// inventing its own reasonable-looking-but-different structure. The zod
+// validation in parseAndValidate() is still the real gate either way; this
+// just makes a first-try schema match far more likely from a model family
+// that isn't natively schema-constrained.
+const JSON_SHAPE_INSTRUCTIONS = `Respond with ONLY a raw JSON object - no markdown, no code fences, no commentary before or after - matching exactly this shape:
+{
+  "title": string,
+  "subject": string,
+  "pages": [
+    {
+      "sections": [
+        {
+          "subheading": string,
+          "bullets": string[],
+          "highlights": string[],
+          "formula": string or null,
+          "table": { "headers": string[], "rows": string[][] } or null,
+          "callout": { "type": "Exam Tip" | "Common Mistake" | "Important" | "Must Remember" | "Memory Trick", "text": string } or null
+        }
+      ]
+    }
+  ]
+}
+"formula", "table", and "callout" are optional per section - use null or omit when not warranted, never force one in.`;
 
+function buildUserPrompt(transcript, title) {
+  return title ? `Lecture title hint: "${title}"\n\nTranscript:\n${transcript}` : `Transcript:\n${transcript}`;
+}
+
+function parseAndValidate(raw, providerLabel) {
+  let json;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    throw new Error(`${providerLabel} did not return valid JSON for the structured notes.`);
+  }
+
+  const parsed = NotesSchema.safeParse(json);
+  if (!parsed.success) {
+    throw new Error(`Structured notes from ${providerLabel} failed schema validation: ${parsed.error.message}`);
+  }
+  return parsed.data;
+}
+
+/**
+ * 429/quota-exceeded specifically - the one failure mode that should
+ * advance to the next provider in the chain. Everything else (malformed
+ * transcript, a provider's output failing zod validation, network errors,
+ * auth errors) is a real problem that trying a different provider wouldn't
+ * fix, so it should fail loudly and immediately rather than being masked
+ * by silently falling through.
+ */
+function isQuotaError(err) {
+  if (err?.status === 429) return true; // groq-sdk (and most HTTP client errors) set this
+  if (err?.name === "RateLimitError") return true; // groq-sdk's typed error class
+  const message = err?.message || String(err);
+  return /\b429\b|quota|rate.?limit|resource.?exhausted|too many requests/i.test(message);
+}
+
+async function generateWithGemini(transcript, title, modelName) {
+  const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
   const model = genAI.getGenerativeModel({
-    model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+    model: modelName,
     systemInstruction: SYSTEM_PROMPT,
     generationConfig: {
       responseMimeType: "application/json",
@@ -28,24 +91,77 @@ export async function generateNotes(transcript, { title } = {}) {
     },
   });
 
-  const userPrompt = title
-    ? `Lecture title hint: "${title}"\n\nTranscript:\n${transcript}`
-    : `Transcript:\n${transcript}`;
+  const result = await model.generateContent(buildUserPrompt(transcript, title));
+  return parseAndValidate(result.response.text(), modelName);
+}
 
-  const result = await model.generateContent(userPrompt);
-  const raw = result.response.text();
-
-  let json;
-  try {
-    json = JSON.parse(raw);
-  } catch {
-    throw new Error("Gemini did not return valid JSON for the structured notes.");
+async function generateWithGroq(transcript, title) {
+  if (!process.env.GROQ_API_KEY) {
+    throw new Error("GROQ_API_KEY is not set - cannot use Groq as a fallback provider.");
   }
 
-  const parsed = NotesSchema.safeParse(json);
-  if (!parsed.success) {
-    throw new Error(`Structured notes failed schema validation: ${parsed.error.message}`);
-  }
+  const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+  const completion = await groq.chat.completions.create({
+    model: "llama-3.3-70b-versatile",
+    messages: [
+      { role: "system", content: `${SYSTEM_PROMPT}\n\n${JSON_SHAPE_INSTRUCTIONS}` },
+      { role: "user", content: buildUserPrompt(transcript, title) },
+    ],
+    response_format: { type: "json_object" },
+  });
 
-  return parsed.data;
+  const raw = completion.choices[0]?.message?.content;
+  if (!raw) throw new Error("Groq returned an empty response.");
+  return parseAndValidate(raw, "groq-llama-3.3-70b");
+}
+
+/**
+ * Gemini's free tier caps out fast (gemini-2.5-flash: ~20 requests/day),
+ * so a single busy day of testing/use exhausts it - already happened
+ * repeatedly during this project's own hosted testing (see the README's
+ * Gemini quota note). Priority order, each step only reached if the
+ * previous one hit a quota error specifically:
+ *
+ * 1. gemini-2.5-flash - best quality, current primary.
+ * 2. gemini-2.5-flash-lite - same Google account/API key, a separate
+ *    ~1,000 RPD quota bucket, same native responseSchema support - a
+ *    same-family swap, not a different integration.
+ * 3. groq-llama-3.3-70b - a genuinely separate provider/account
+ *    (GROQ_API_KEY), ~14,400 RPD free-tier headroom. Different model
+ *    family, no native JSON-schema constraining on Groq's side - leans on
+ *    JSON_SHAPE_INSTRUCTIONS in the prompt plus the same zod validation
+ *    every provider's output goes through either way.
+ */
+export async function generateNotes(transcript, { title } = {}) {
+  const providers = [
+    { label: process.env.GEMINI_MODEL || "gemini-2.5-flash", run: () => generateWithGemini(transcript, title, process.env.GEMINI_MODEL || "gemini-2.5-flash") },
+    { label: "gemini-2.5-flash-lite", run: () => generateWithGemini(transcript, title, "gemini-2.5-flash-lite") },
+    { label: "groq-llama-3.3-70b", run: () => generateWithGroq(transcript, title) },
+  ];
+
+  for (let i = 0; i < providers.length; i++) {
+    const provider = providers[i];
+    try {
+      const notes = await provider.run();
+      if (i > 0) {
+        console.log(`[notesGenerator] generated via fallback provider: ${provider.label}`);
+      }
+      return notes;
+    } catch (err) {
+      const isLast = i === providers.length - 1;
+      if (!isQuotaError(err)) {
+        // Not a quota problem - a different provider wouldn't fix it
+        // either, so surface it immediately instead of masking it behind
+        // more (doomed) attempts.
+        throw err;
+      }
+      console.error(
+        `[notesGenerator] ${provider.label} hit a quota/rate-limit error${isLast ? "" : ", trying next provider"}:`,
+        err.message
+      );
+      if (isLast) {
+        throw new Error("All note-generation providers are currently rate-limited. Try again later.");
+      }
+    }
+  }
 }
