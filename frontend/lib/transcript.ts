@@ -34,6 +34,17 @@ declare global {
       fetchTranscript: (youtubeUrl: string) => Promise<ClientTranscriptResult | null>;
       getSetting?: (key: string) => Promise<string | null>;
       setSetting?: (key: string, value: string) => Promise<void>;
+      // Electron's on-device equivalent of @capacitor/filesystem for
+      // persisting a generated PDF durably (see lib/pdfStore.ts) -
+      // Electron has no Capacitor Filesystem plugin of its own, same
+      // reasoning as getSetting/setSetting above using this bridge instead
+      // of a Capacitor plugin.
+      savePdf?: (jobId: string, filename: string, base64: string) => Promise<{ path: string } | null>;
+      readPdf?: (path: string) => Promise<{ data: string } | null>;
+      // Desktop has no native share-sheet - revealing the already-saved
+      // file in the OS file browser is the closest honest equivalent (see
+      // lib/pdfStore.ts's sharePersistedPdf).
+      revealFile?: (path: string) => Promise<void>;
     };
   }
 }

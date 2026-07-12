@@ -7,6 +7,7 @@ import type { RecentActivity } from "./AppShell";
 interface HomeScreenProps {
   onNewNotes: () => void;
   recentActivity: RecentActivity[];
+  onSelectActivity: (activity: RecentActivity) => void;
 }
 
 function timeAgo(ts: number): string {
@@ -22,11 +23,11 @@ function timeAgo(ts: number): string {
  * The new landing point (see AppShell) - a dashboard, not a form. The
  * generate flow (mode-choice -> picker -> progress -> done) is now
  * something launched *from* here via "New Notes," not the app's default
- * state. Recent activity is honestly session-only - AppShell doesn't
- * persist it anywhere, so an empty list here just means nothing has
- * finished generating yet this session, not "no data yet, fake some in."
+ * state. Recent activity is real cross-session history now (see
+ * lib/sessionHistory.ts) - an empty list here means nothing has ever been
+ * generated on this device, not just "nothing yet this session."
  */
-export default function HomeScreen({ onNewNotes, recentActivity }: HomeScreenProps) {
+export default function HomeScreen({ onNewNotes, recentActivity, onSelectActivity }: HomeScreenProps) {
   return (
     <div className={styles.homeRoot}>
       <div className={styles.homeHeader}>
@@ -44,16 +45,21 @@ export default function HomeScreen({ onNewNotes, recentActivity }: HomeScreenPro
         </span>
       </button>
 
-      <p className={styles.sectionLabel}>This session</p>
+      <p className={styles.sectionLabel}>Recent notes</p>
       {recentActivity.length === 0 ? (
         <div className={styles.emptyState}>
           <FileText size={22} strokeWidth={1.75} color="var(--pencil-grey)" />
-          <p>Nothing generated yet this session - start with New Notes above.</p>
+          <p>Nothing generated yet - start with New Notes above.</p>
         </div>
       ) : (
         <div className={styles.recentList}>
           {recentActivity.map((item) => (
-            <div className={styles.recentItem} key={item.jobId}>
+            <button
+              type="button"
+              className={styles.recentItem}
+              key={item.jobId}
+              onClick={() => onSelectActivity(item)}
+            >
               <span className={styles.recentIcon}>
                 <FileText size={17} strokeWidth={2} />
               </span>
@@ -64,10 +70,12 @@ export default function HomeScreen({ onNewNotes, recentActivity }: HomeScreenPro
                   {timeAgo(item.completedAt)}
                 </p>
               </span>
-            </div>
+            </button>
           ))}
         </div>
       )}
+
+      <p className={styles.footerCredit}>dreamed up by hisarchives</p>
     </div>
   );
 }

@@ -18,4 +18,9 @@ contextBridge.exposeInMainWorld("notesifyBridge", {
   // a Capacitor-only plugin with no meaning in a plain Electron shell.
   getSetting: (key) => ipcRenderer.invoke("get-setting", key),
   setSetting: (key, value) => ipcRenderer.invoke("set-setting", key, value),
+  // Durable on-device PDF storage (see frontend/lib/pdfStore.ts) - Electron's
+  // equivalent of the mobile build's @capacitor/filesystem writes.
+  savePdf: (jobId, filename, base64) => ipcRenderer.invoke("save-pdf", jobId, filename, base64),
+  readPdf: (path) => ipcRenderer.invoke("read-pdf", path),
+  revealFile: (path) => ipcRenderer.invoke("reveal-file", path),
 });

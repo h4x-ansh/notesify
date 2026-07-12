@@ -110,13 +110,15 @@ export default function SettingsScreen({ settings, onChange }: SettingsScreenPro
         <p className={styles.settingsSectionTitle}>About</p>
         <div className={styles.aboutRow}>
           <span className={styles.aboutKey}>App</span>
-          <span className={styles.aboutValue}>hisarchives / notesify</span>
+          <span className={styles.aboutValue}>notesify</span>
         </div>
         <div className={styles.aboutRow}>
           <span className={styles.aboutKey}>Version</span>
           <span className={styles.aboutValue}>{APP_VERSION}</span>
         </div>
       </div>
+
+      <p className={styles.footerCredit}>dreamed up by hisarchives</p>
     </div>
   );
 }

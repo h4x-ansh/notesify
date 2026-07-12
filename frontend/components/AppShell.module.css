@@ -16,6 +16,7 @@
 /* ---------- Splash ---------- */
 
 .splashRoot {
+  position: relative;
   min-height: 100vh;
   min-height: 100dvh;
   display: flex;
@@ -79,20 +80,23 @@
   }
 }
 
-.splashCaption {
-  font-size: 12px;
-  letter-spacing: 0.16em;
-  text-transform: uppercase;
-  color: var(--pencil-grey);
-  opacity: 0;
-  animation: fade-in 400ms ease forwards;
-  animation-delay: 700ms;
-}
-
 @keyframes fade-in {
   to {
     opacity: 1;
   }
+}
+
+/* Only ever mounted once the wait has already gone on a few seconds (see
+   AppShell.tsx's WAKING_MESSAGE_DELAY_MS), so it gets its own gentle
+   fade-in on arrival. */
+.splashStatus {
+  position: absolute;
+  bottom: 48px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--pencil-grey);
+  opacity: 0;
+  animation: fade-in 500ms ease forwards;
 }
 
 /* ---------- Bottom nav ---------- */
@@ -180,6 +184,16 @@
   margin: 0;
 }
 
+/* A co-brand credit, not a logo - small and muted enough to not compete
+   with "notesify" as the actual app identity above. */
+.footerCredit {
+  margin: 32px 0 0;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--pencil-grey);
+  text-align: center;
+}
+
 .newNotesCard {
   display: flex;
   align-items: center;
@@ -248,11 +262,19 @@
   display: flex;
   align-items: center;
   gap: 12px;
+  width: 100%;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 14px 16px;
   box-shadow: var(--shadow-paper);
+}
+
+.recentItem:active {
+  transform: scale(0.99);
 }
 
 .recentIcon {
@@ -279,6 +301,38 @@
   font-size: 11.5px;
   color: var(--pencil-grey);
   margin: 0;
+}
+
+/* ---------- Session detail screen ---------- */
+
+.detailThumb {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+  border-radius: 10px;
+  margin-bottom: 16px;
+  background: var(--bg);
+}
+
+.detailUrlBox {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin: 4px 0 20px;
+}
+
+.detailUrlLine {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  word-break: break-all;
+  margin: 0;
+}
+
+.detailUrlLine + .detailUrlLine {
+  margin-top: 6px;
 }
 
 .emptyState {

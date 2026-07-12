@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain } from "electron";
+import { app, BrowserWindow, ipcMain, shell } from "electron";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -181,6 +181,54 @@ ipcMain.handle("set-setting", (_event, key, value) => {
   const data = readSettingsFile();
   data[key] = value;
   writeSettingsFile(data);
+});
+
+// Durable on-device PDF storage (see frontend/lib/pdfStore.ts) - Electron's
+// equivalent of the mobile build's @capacitor/filesystem Directory.Data
+// writes, since a renderer with contextIsolation:true/nodeIntegration:false
+// has no fs access of its own. Lives under userData (same parent dir as
+// main.log/settings.json above), not the backend's own JOBS_OUTPUT_DIR -
+// that dir holds the backend's working copy keyed to its own in-memory job
+// store, which doesn't survive a backend restart; this is a separate,
+// intentionally-durable copy the renderer owns the lifecycle of.
+const pdfsDir = path.join(logDir, "pdfs");
+mkdirSync(pdfsDir, { recursive: true });
+
+function safePdfFilename(jobId, filename) {
+  // jobId is a server-generated UUID (never user input); filename comes
+  // from the backend's own Content-Disposition header, built from the
+  // notes title with non-word characters already stripped (see
+  // server.js's /download route) - stripped again here regardless, since
+  // this is what actually becomes a filesystem path.
+  const cleanName = String(filename).replace(/[^\w\- .]+/g, "").trim() || "notes.pdf";
+  return `${jobId}-${cleanName}`;
+}
+
+ipcMain.handle("save-pdf", (_event, jobId, filename, base64) => {
+  try {
+    const filePath = path.join(pdfsDir, safePdfFilename(jobId, filename));
+    writeFileSync(filePath, Buffer.from(base64, "base64"));
+    return { path: filePath };
+  } catch (err) {
+    log("[save-pdf IPC] failed:", err?.message || String(err));
+    return null;
+  }
+});
+
+ipcMain.handle("read-pdf", (_event, filePath) => {
+  try {
+    const data = readFileSync(filePath);
+    return { data: data.toString("base64") };
+  } catch (err) {
+    log("[read-pdf IPC] failed:", err?.message || String(err));
+    return null;
+  }
+});
+
+// Desktop has no native share-sheet - revealing the file in Explorer/Finder
+// is the closest honest equivalent (see lib/pdfStore.ts's sharePersistedPdf).
+ipcMain.handle("reveal-file", (_event, filePath) => {
+  shell.showItemInFolder(filePath);
 });
 
 let backendProcess = null;

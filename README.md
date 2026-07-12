@@ -2046,3 +2046,478 @@ sizes - not assumed:**
   persisted values as its starting selection, proving the defaults
   actually flow through to affect a real generation, not just echo back
   on the settings page that set them.
+
+## Fixing the splash screen cutting off mid-animation
+
+`AppShell.tsx`'s splash floor (`MIN_SPLASH_MS`) was 550ms - shorter than
+the splash's own ink-reveal/pen-travel CSS animation, which (per
+`AppShell.module.css`'s `.splashWordmark`/`.splashPen`: `animation-delay:
+150ms` + `900ms` duration) doesn't finish until 1050ms, with the
+`.splashCaption` fade-in finishing slightly later still at 1100ms
+(`animation-delay: 700ms` + `400ms`). The transition to Home fired at
+whichever was later of {550ms floor, real settings-load time} - almost
+always the 550ms floor in practice, cutting "notesify" off mid-write.
+
+**Fix**: `MIN_SPLASH_MS` is now derived from the actual animation timeline
+instead of an arbitrary guess - named constants (`INK_REVEAL_DELAY_MS`,
+`INK_REVEAL_DURATION_MS`, `CAPTION_DELAY_MS`, `CAPTION_DURATION_MS`)
+mirror the exact numbers in `AppShell.module.css` (duplicated rather than
+shared, since CSS keyframe timing and a JS `setTimeout` value have no
+common source of truth without build tooling this project doesn't use -
+if the CSS durations ever change, these must change too, called out
+explicitly in the comment). `SPLASH_ANIMATION_END_MS` takes the later of
+the two animations' actual end times, plus a buffer for `MIN_SPLASH_MS`.
+
+**The buffer size itself came from a real measurement, not the task's own
+suggested +100-200ms example** - sampling the wordmark's live
+`getComputedStyle().clipPath` on a real build via Puppeteer (not assumed
+from the CSS numbers) showed the animation didn't actually finish
+visually until ~1440-1470ms after navigation start, well past the naive
+1100ms delay+duration figure - JS parse/hydration time before the
+component even mounts and starts its `animation-delay` clock eats into
+the budget pure CSS math doesn't account for. The buffer was set to
++400ms (not +150ms) specifically because the first attempt at this fix,
+using the smaller example buffer, was verified against real timing data
+and found to still cut it close - real measurement overrode the
+task's own suggested range once it turned out to be insufficient in
+practice.
+
+**Verified by directly sampling the live animation state on a real
+build, not "looks probably long enough":**
+- A real Puppeteer session polled `getComputedStyle()` on the actual
+  wordmark `<p>` element every ~30ms from navigation start, recording its
+  `clip-path` value and the exact moment the screen transitioned to Home
+  (`document.body.innerText` first containing "New Notes").
+- **First attempt caught a real test-script bug worth noting**: the
+  initial sampling selector (`[class*="splashWordmark"]`) matched the
+  *parent* `.splashWordmarkWrap` div instead of the animated `<p>` (its
+  class name contains "splashWordmark" as a substring too, and being the
+  parent, it wins `querySelector`'s document-order match) - that
+  wrapper has no animation of its own, so every sample silently read
+  `clip-path: none` regardless of what the real text was doing.
+  Corrected to `p[class*="splashWordmark"]` before trusting any of the
+  results.
+- **With the corrected selector, real sample data**: `clip-path` was
+  still `inset(0px 100% 0px 0px)` (fully hidden) through ~900ms, then
+  visibly unwound - 85% hidden at 928ms, 45% at 1054ms, 4% at 1180ms - and
+  reached fully-revealed (`inset(0px 0% 0px 0px)`) at **1244ms**,
+  *staying* fully revealed for the next 27 consecutive samples through
+  **1752ms**, with the actual transition to Home not happening until
+  **1784ms** - a real, directly-observed ~540ms margin between "the text
+  finished writing in" and "the screen changed," not a coin-flip race.
+- Rebuilt both frontend targets and synced Android after confirming the
+  fix, so the packaged builds reflect the corrected timing, not just the
+  dev/test server used to verify it.
+
+## Merging server wake-up into the splash screen
+
+Previously the splash had a fixed, animation-driven duration
+(`ANIMATION_COMPLETE_MS`, see the fix above), and `NotesApp.tsx` did its
+own independent `/health` probe the moment the user reached the "New
+Notes" screen. If the hosted Render backend was cold (idle >15min and
+spun down), the splash would finish on its own schedule, hand off to
+Home, and *then* - only once the user actually navigated into New Notes -
+a separate "checking-server"/"server-unreachable" state would appear and
+sit there retrying. Two visually distinct loading moments for what's
+really one wait.
+
+**Fix**: `AppShell.tsx` now kicks off a real `checkHealth()` poll the
+moment the splash mounts, in parallel with the splash's own CSS
+animation, and the splash's dismissal rule became: (animation finished
+AND health check succeeded) OR a hard cap has elapsed, whichever comes
+first.
+
+- Implemented as three timers/closures racing against shared
+  `animationDone`/`healthOk`/`dismissed` flags rather than a single
+  `Promise.race`/`Promise.all` - the requirement is asymmetric (the clean
+  success path needs *both* conditions ANDed together, but giving up
+  needs only *one* condition, the cap), which doesn't map onto a single
+  combinator without the same manual bookkeeping this already does.
+- `MAX_HEALTH_WAIT_MS` (18s) is the hard cap - fires unconditionally, so a
+  dead/unreachable backend, or one that just never wakes up in time,
+  can't trap the user on the splash forever.
+- If the wait passes `WAKING_MESSAGE_DELAY_MS` (3.5s - comfortably after
+  the animation's own ~1.7s natural finish, so it never flashes in on a
+  normal warm load), `SplashScreen` renders a new optional
+  `statusMessage` prop as small, subtle text below the existing caption -
+  "Waking up the server..." for the hosted backend, "Waiting for the
+  local server..." for Electron-local, reusing the exact copy/wording
+  `NotesApp.tsx`'s own `server-unreachable` view already used, for
+  consistency.
+- `NotesApp.tsx` gained a new `initialServerHealthy` prop. When
+  `AppShell`'s own check already succeeded, `NotesApp` skips its
+  redundant initial probe entirely and starts straight at `mode-choice`
+  instead of `checking-server` - it no longer needs to re-verify
+  connectivity every single time the user re-enters the generate screen.
+  When `AppShell`'s check *didn't* succeed (failed or hit the cap),
+  `initialServerHealthy` is false/undefined and `NotesApp`'s existing
+  probe/retry/`server-unreachable` UI runs exactly as before - that UI
+  wasn't removed, just no longer duplicated at boot.
+
+**Verified against a real backend and a real static-export build, not
+mocks** (`next build` output served over plain HTTP, real Puppeteer
+sessions, no test doubles for the app's own code):
+
+- **Warm backend** (`node server.js`, no artificial delay): splash
+  dismissed after **1749ms** - close to the animation's own natural
+  ~1.7-1.9s completion, not artificially stretched toward the 18s cap.
+- **Simulated cold-start** (Puppeteer request interception delaying the
+  first two `/health` calls 4s each before letting the third through -
+  standing in for a genuinely cold Render instance, which can't be forced
+  to sleep on demand in a test run): the "Waiting for the local
+  server..." status text appeared at **3938ms** (matching
+  `WAKING_MESSAGE_DELAY_MS`'s ~3.5s target), and the splash dismissed at
+  **10423ms** once the third `/health` call succeeded - 3 total health
+  calls, matching the 2 simulated failures + 1 success.
+- **Fully unreachable backend** (every `/health` call intercepted to
+  return 500): splash dismissed at **18289ms**, matching the
+  `MAX_HEALTH_WAIT_MS` cap almost exactly (9 health calls made during the
+  wait) rather than hanging indefinitely. Home rendered normally right
+  after. Navigating into "New Notes" from there triggered `NotesApp`'s
+  own existing probe (since `initialServerHealthy` was never set true)
+  and correctly showed its fallback retry UI - confirming the two states
+  hand off cleanly rather than either duplicating or dropping the
+  error-recovery path.
+- Rebuilt both frontend targets (`npm run build`, `npm run build:mobile`)
+  and re-ran `npx cap sync android` after verification, so the packaged
+  builds carry the fix. Test scripts and the temporary local backend/
+  static-file-server processes used for verification were removed/killed
+  by exact PID afterward.
+
+## Rebrand: subtle hisarchives credit instead of prominent splash branding
+
+"HISARCHIVES" (in practice, the lowercase string `hisarchives`) previously
+appeared as prominent, always-visible UI text in three places: the
+splash screen's caption line under the "notesify" wordmark, a persistent
+`hisarchives / notesify` header bar shown on every screen of the generate
+flow, and the Settings "About" section's `App` value. The ask: make
+"notesify" the only thing that reads as the app's actual brand, and
+demote the hisarchives credit to a small, muted, unmistakably secondary
+line - not remove the credit outright, just stop it competing visually.
+
+**Audit** - `grep -ri hisarchives` across the whole repo (excluding
+`node_modules`) turned up 11 files. Sorted into two buckets:
+
+- **Actual UI text** (in scope): `SplashScreen.tsx`'s caption, `NotesApp.tsx`'s
+  brand header, `SettingsScreen.tsx`'s About row.
+- **Non-visual identifiers** (deliberately left alone): the Android
+  package ID / Electron `appId` (`com.hisarchives.notesify`, in
+  `capacitor.config.ts`, `electron-builder.config.mjs`, `build.gradle`,
+  `strings.xml`, `MainActivity.java`'s package declaration), the npm
+  package name (`hisarchives-notesify` in `package.json`/
+  `package-lock.json`), and the HTML `<title>` (`app/layout.tsx`,
+  "Notesify — hisarchives" - a browser-tab string, never rendered as
+  visible page content). Renaming any of these is an app-identity/package-
+  signing change with real consequences (Android package IDs in
+  particular can't be changed post-release without becoming a different
+  app to the Play Store), not a branding-prominence question - out of
+  scope for what this task actually asked for.
+- **PDF template**: checked `src/template.js` and the rest of `src/` for
+  any hisarchives/notesify branding baked into the generated notebook
+  pages themselves - none exists. Nothing to change there.
+
+**Changes**:
+
+- `SplashScreen.tsx`: the `hisarchives` caption `<p>` removed entirely -
+  the splash is now just the ink-reveal "notesify" wordmark and pen icon,
+  nothing else (the still-relevant `statusMessage` slot for the server
+  wake-up wait, see the section above, is unaffected). `AppShell.tsx`'s
+  animation-timing constants were simplified to match (the caption's own
+  `animation-delay`/`duration` no longer factor into
+  `SPLASH_ANIMATION_END_MS`, since there's nothing left to time against).
+- `NotesApp.tsx`'s always-visible top brand bar: `hisarchives /
+  **notesify**` -> just `**notesify**` - this bar exists on every screen
+  of the generate flow specifically to orient the user ("what app is
+  this"), which "notesify" alone still does; it isn't a footer/about
+  context, so it's not where the subtle credit line belongs either -
+  removing hisarchives here is a pure declutter, matching the splash's
+  now-clean treatment, not a relocation.
+- `HomeScreen.tsx`: new footer, `dreamed up by hisarchives`, in a new
+  `.footerCredit` class (11px, `--pencil-grey`, centered, no visual
+  weight next to the actual "notesify" wordmark/New Notes card above it).
+- `SettingsScreen.tsx`: the About section's `App` value changed from
+  `hisarchives / notesify` to plain `notesify` (matching the app-identity
+  treatment everywhere else now), and the same `dreamed up by hisarchives`
+  footer line was added below the About section.
+
+**Verified against the real packaged Electron app** (not a plain-browser
+dev server - launched the actual `electron.exe` binary with
+`--remote-debugging-port` and drove it with a real Puppeteer connection,
+so this exercises the exact build users run):
+
+- Splash screenshot: only the "notesify" wordmark and pen icon - no
+  hisarchives text anywhere on screen.
+- Home screen: `document.body.innerText` contains `dreamed up by
+  hisarchives`; screenshot confirms it renders small and muted below the
+  session list, not competing with the wordmark/New Notes card.
+- Settings screen: same credit line present and styled the same way.
+- Generate-flow header: confirmed it reads exactly `notesify` (no
+  `hisarchives`) via both a screenshot and a direct
+  `document.body.innerText.includes("hisarchives")` check, which came
+  back `false`.
+- Rebuilt both frontend targets and re-synced Android after verification.
+
+## Session-detail screen: tappable "This session" items backed by real on-device file persistence
+
+The Home screen's "This session" activity list was static - items showed
+a title/page-count/timestamp but did nothing when tapped. The ask: make
+each item open a detail screen with a thumbnail (single-video only),
+the source URL(s), and working re-download/share buttons - and,
+critically, verify those buttons actually read from a file already
+persisted on-device from generation time, not a silent re-fetch from the
+backend.
+
+**Investigating existing persistence first** (before assuming it existed):
+traced the full path from a job reaching "done" to the PDF becoming
+available for download. Two relevant facts, neither of which added up to
+real on-device persistence tied to a session-list item:
+
+- The backend (`server.js`) does write each job's PDF to disk
+  (`JOBS_DIR/{jobId}.pdf`) - but that's the backend's own working copy,
+  looked up by an **in-memory** job store (`getJob()`) that doesn't
+  survive a backend restart, and on the hosted Render deployment that
+  directory is on Render's own ephemeral filesystem, not the user's
+  device at all.
+- The client side (`NotesApp.tsx`'s "done" view) only ever held the PDF
+  as an in-memory `Blob`/`blob:` URL, gone the moment that view unmounted
+  (e.g. navigating back to Home). The mobile-only "Download PDF" tap
+  (`downloadPdf.ts`'s `savePdfOnMobile`) wrote to Capacitor's
+  `Directory.Cache` - explicitly a transient staging area for its own
+  immediate write-then-share flow, not meant to last, and never linked
+  back to a `RecentActivity` entry for later retrieval anyway. Electron
+  had no on-device write path for a generated PDF at all - the desktop
+  "download" was just a `blob:` URL anchor tag, gone once revoked.
+
+**Conclusion: no real persistence existed for this purpose.** Added it as
+part of this task rather than assuming otherwise.
+
+**New persistence layer** (`frontend/lib/pdfStore.ts`):
+
+- `persistPdfLocally(jobId, filename, blob)` - writes durably at the
+  moment a job's PDF is fetched (see `NotesApp.tsx`'s PDF-fetch effect,
+  which now `await`s this before calling `onJobCompleted`, so a session
+  list item never exists without its file already having been written).
+  Two backends, mirroring the exact `window.notesifyBridge` /
+  `@capacitor/*` split `lib/settings.ts` already established for Electron
+  vs. mobile settings persistence:
+  - **Electron**: a new `save-pdf` IPC handler (`electron/main.js`)
+    writes the bytes to `{userData}/pdfs/{jobId}-{filename}` - a
+    renderer with `contextIsolation: true`/`nodeIntegration: false` has
+    no `fs` access of its own, same reasoning as the existing
+    `get-setting`/`set-setting` handlers.
+  - **Mobile**: `@capacitor/filesystem`'s `Filesystem.writeFile` to
+    `Directory.Data` (persistent, survives app restarts and OS
+    storage-pressure cleanup - deliberately not the `Directory.Cache`
+    `savePdfOnMobile` already uses for its own throwaway staging).
+  - Plain-browser dev (neither backend available): resolves `null` -
+    persistence is treated as unavailable, not an error; the session
+    item still gets created, its re-download/share buttons just stay
+    disabled with an explanatory message.
+- `reDownloadPersistedPdf`/`sharePersistedPdf` - both read the bytes back
+  from disk (`readPdf` IPC / `Filesystem.readFile`), **never** call the
+  backend. Re-download reuses the exact mechanism the original generate
+  flow's own "Download PDF" button already used per platform (mobile:
+  `savePdfOnMobile`'s write-to-Cache-then-share; Electron: the same
+  temporary-anchor-click-a-`blob:`-URL technique). Share reuses
+  `savePdfOnMobile` on mobile (the app's only existing native
+  share-sheet code path); Electron has no native share-sheet concept, so
+  its closest honest equivalent is a new `reveal-file` IPC handler
+  (`shell.showItemInFolder`) that opens the file's location in Explorer -
+  falls back to the same re-download behavior if that bridge method isn't
+  available.
+
+**Wiring**: `RecentActivity` (`AppShell.tsx`) gained `sourceUrls`,
+`filename`, and `localPdfPath`. `NotesApp.tsx` tracks `jobId -> source
+URL(s)` in a ref (`jobSourcesRef`, single-video-only, matching the
+existing "not fired per-chunk for a batch" scoping `onJobCompleted`
+already had) and now fires `onJobCompleted` from the PDF-fetch effect
+(after persistence) instead of the moment `/status` first reports "done."
+`HomeScreen.tsx`'s recent-activity rows became real `<button>`s
+(`onSelectActivity`); `AppShell.tsx` renders the new
+`SessionDetailScreen.tsx` as an overlay on top of whatever tab is active
+when an item is selected - not its own bottom-nav destination, same
+pattern the generate screen itself already uses. `extractYoutubeVideoId`
+(`lib/api.ts`) builds the `https://img.youtube.com/vi/{id}/hqdefault.jpg`
+thumbnail URL for single-video entries only; a `sourceUrls.length !== 1`
+entry (a would-be multi-video/batch item) skips the thumbnail entirely
+rather than guessing which video to show - moot today since batch jobs
+never populate `RecentActivity` in the first place, but the check is
+there for when they do.
+
+**Verified against the real packaged Electron app, not mocks** - same
+technique as the rebrand verification above (`electron.exe` launched
+directly with `--remote-debugging-port`, driven by a real Puppeteer
+connection over CDP, so this is the actual local Express backend
+(`server.js`) and actual Electron IPC handlers, not a stand-in):
+
+- **Real generation end-to-end**: drove the full mode-choice -> single
+  video -> picker -> generate flow against a real YouTube URL, through
+  the real backend, with real Gemini/Groq calls, waiting for the actual
+  "done" view (confirmed via screenshot) - not a synthetic job record.
+- **File actually persisted on disk**: after generation, confirmed via a
+  direct filesystem check that `{userData}/pdfs/{jobId}-notes.pdf` existed
+  - a real file written by the new `save-pdf` IPC handler, separate from
+    the backend's own `{userData}/jobs/{jobId}.pdf` working copy.
+- **Home list -> detail screen**: confirmed the new session item appeared
+  on Home with the real generated title, tapped it, and confirmed the
+  detail screen showed the correct YouTube URL as read-only text and a
+  thumbnail image that actually loaded (`naturalWidth: 480`, confirmed
+  via `img.complete`/`img.naturalWidth` rather than just checking the
+  `src` attribute was set).
+- **Re-download and Share, proven not to hit the network**: attached a
+  Puppeteer `page.on("request")` listener before clicking each button -
+  zero requests fired during either action (not to the local backend, not
+  anywhere), while both actions still completed successfully
+  (`"Saved to this device."`). Independently confirmed via the
+  filesystem: `Re-download` produced a real `notes.pdf` in the Windows
+  Downloads folder with fresh content (verified by direct file listing,
+  timestamped seconds after the click) sourced entirely from the
+  IPC-read bytes; `Share`'s `reveal-file` IPC call completed without
+  error in `main.log`. Together, a real disk write plus zero network
+  traffic is stronger evidence of "not a silent re-fetch" than an
+  offline/airplane-mode toggle would have been for this platform, since
+  Electron's own backend is a loopback process disabling networking
+  wouldn't actually have touched.
+- **Mobile (Capacitor/Android) note**: the mobile persistence path
+  (`Directory.Data` writes/reads, `Share.share`) reuses the identical
+  Capacitor APIs `savePdfOnMobile` already relies on elsewhere in this
+  codebase, and both frontend targets were rebuilt and `npx cap sync
+  android` re-run - but this environment has no `adb`/emulator available,
+  so the mobile path itself wasn't exercised on a real device/emulator
+  this session, only code-reviewed against the same pattern. Worth a real
+  device test before shipping.
+- Cleaned up afterward: test scripts removed, the one PDF this test wrote
+  to the Downloads folder removed, and the specific `{jobId}.pdf`/
+  `{jobId}-notes.pdf` files this test's own real generation created were
+  removed by exact filename (the `jobs`/`pdfs` directories themselves
+  were left alone, since they may hold real output from actual prior
+  app usage, not just this session's test). The Electron process this
+  verification launched was stopped by exact PID after confirming its
+  parent/child relationship to the spawned backend, not by name-matching.
+
+## Session history: surviving app restart, and a real in-app back stack
+
+Two related navigation/persistence bugs, fixed together since both touch
+how `AppShell.tsx` and `NotesApp.tsx` model "where the user currently is."
+
+**Bug 1 - Home's list didn't survive an app restart.** The underlying PDF
+files were already durably persisted on-device (see the section above),
+but the *list itself* - title, source URL, timestamp, which file it
+points at - lived only in `AppShell`'s in-memory `recentActivity` state,
+reset to `[]` on every fresh launch. A real past generation's file could
+still exist on disk with no UI path back to it.
+
+**Fix**: `frontend/lib/sessionHistory.ts` persists that list as a small
+JSON-array index (`notesify.sessionHistory.v1`, capped at
+`MAX_HISTORY_ENTRIES = 10`, same cap as before) under the exact same
+storage backend `lib/settings.ts` already used - the two files' identical
+get/set logic was pulled out into a new shared `lib/localKV.ts` rather
+than left duplicated. `AppShell`'s boot effect now loads this index
+alongside settings; `handleJobCompleted` saves the updated list every
+time a generation completes (fire-and-forget, same policy as
+`saveSettings`). Each entry already carried its `localPdfPath` (see the
+prior section) - persisting the *list* is what makes that reference
+reachable again after a restart, since the file was durable all along.
+Also renamed Home's "This session" label to "Recent notes" and updated
+its doc comments/empty-state copy, since the list is honestly no longer
+session-scoped.
+
+**Bug 2 - the Android hardware/gesture back button exited the app instead
+of navigating.** Capacitor's default Android behavior with no
+`backButton` listener registered is to fall back to WebView history (this
+app doesn't use real routing, so there's nothing there) or just exit -
+in practice, pressing back from several screens deep closed the whole
+app instead of stepping back one screen at a time.
+
+**Fix**: `NotesApp.tsx` gained a pure `previousView(view): View | null`
+function describing one step of "back" through its own mode-choice ->
+input/multi-link -> picker -> confirm-chunks sub-navigation (terminal
+states like progress/done/error have no meaningful mid-flow back target,
+so they resolve to `null`), and a `goBack()` that steps to it or bubbles
+out via `onBack` (AppShell's "go to Home") when there isn't one. Every
+visible back/cancel button in that flow (multi-link's, the picker's, and
+confirm-chunks' "Cancel") was refactored to call this same `goBack`
+instead of hand-writing its own target, so they can't drift out of sync
+with what the hardware button does. `NotesApp` re-registers `goBack` with
+`AppShell` via a new `registerBackHandler` prop every time its view
+changes; `AppShell` stores whatever it's most recently been given in a
+ref and calls it from a new `App.addListener('backButton', ...)` listener
+(the `@capacitor/app` plugin, newly added - see `frontend/package.json`),
+gated behind `isNativeMobile()` so it's never registered on Electron/web,
+where the event can't fire anyway. `AppShell`'s own handler treats the
+session-detail overlay as the top of the stack (closes it first), then
+delegates to `NotesApp`'s registered handler while on the "generate" tab,
+then falls back to jumping to Home from any other tab, and only calls
+`CapacitorApp.exitApp()` once genuinely at Home with nothing else open.
+
+**Audit for missing visible back affordances** (per the task - every
+screen needs one, not just hardware back): the always-present `‹ Home`
+link at the top of every `NotesApp` screen already covered a "jump out"
+option everywhere, but `input` (the single-video URL form) had no
+*granular* one-step-back of its own, unlike every sibling screen
+(multi-link, picker, confirm-chunks all already had one) - added a
+matching `‹ Back` button there, wired to the same `goBack`. Settings and
+session-detail were already fine (Settings is a bottom-nav tab root, not
+a pushed screen, so the tab bar itself is its "back"; session-detail
+already had its own `‹ Home` link).
+
+**A related gap found while verifying, fixed alongside**: tapping a
+bottom-nav tab while the session-detail overlay was open changed
+`screen` state but the overlay kept rendering over it regardless (its
+render check was `selectedActivity ? <SessionDetailScreen/> : ...`,
+independent of which tab `screen` pointed at) - so the tap appeared to do
+nothing. `BottomNav`'s `onNavigate` now also clears `selectedActivity`,
+consistent with treating it as the top of the same navigation stack the
+hardware-back handler already models it as.
+
+**Verified against the real packaged Electron app** (same technique as
+the sections above - `electron.exe` launched directly with
+`--remote-debugging-port`, driven by a real Puppeteer CDP connection):
+
+- **Restart persistence**: ran a real generation end-to-end through the
+  real backend, confirmed the entry appeared on Home, then **force-killed
+  the entire Electron process tree by exact PID** (not just closing a
+  window - verified via `Get-CimInstance Win32_Process` that the main GUI
+  process and every child, including the spawned backend, were gone
+  before proceeding) to simulate a genuine app close, not a background/
+  resume. Relaunched fresh: confirmed via direct inspection of
+  `settings.json` that the history entry (title, source URL, filename,
+  `localPdfPath`) was written to disk after the original generation, and
+  confirmed via a fresh Puppeteer session that Home showed the restored
+  entry, its detail screen showed the correct thumbnail/URL, and
+  **Re-download fired zero network requests** while still succeeding
+  (`"Saved to this device."`) - reading the exact same on-disk file a
+  cold-started app process had never seen written.
+- **Back navigation, screen by screen**: automated clicks through the
+  actual visible back/cancel buttons on every reachable `NotesApp` view
+  (mode-choice, input, multi-link, picker, confirm-chunks) plus the
+  session-detail screen and the Settings tab, asserting each one landed
+  exactly one step back (e.g. picker's back returned to `input`
+  specifically, not all the way to Home) rather than just "somewhere
+  earlier." All 11 assertions passed on the first genuinely-clean run (an
+  initial run surfaced the BottomNav-overlay gap above as a real
+  `FAIL`, fixed, then re-verified green). Since `goBack` is the single
+  function both the visible buttons and the hardware-back listener call,
+  this exercises the exact same logic the hardware button uses, not a
+  parallel implementation of it.
+- **Hardware back button itself, honestly**: `@capacitor/app`'s
+  `backButton` event only fires through Android's native bridge, which
+  this environment has no `adb`/emulator to drive (same constraint as the
+  mobile-persistence verification in the section above) - it wasn't
+  triggered as a literal Android back-button press here. What *was*
+  verified is everything the listener depends on: the shared
+  `goBack`/`previousView` logic (via the visible buttons, above), the
+  overlay/screen delegation order in `handleHardwareBack` (via direct
+  code review matching the same precedence just verified through the UI),
+  and that the plugin is correctly registered as a native dependency
+  (`npx cap sync android` reports `@capacitor/app@7.1.2` among the
+  synced plugins). Worth a real-device confirmation before shipping.
+- Rebuilt both frontend targets and re-ran `npx cap sync android` after
+  verification. Cleaned up afterward: test scripts removed, and this
+  test's own real generation's specific files
+  (`{jobId}.pdf`/`{jobId}-notes.pdf`) and its one `sessionHistory` entry
+  were removed by exact ID from `settings.json` and the `jobs`/`pdfs`
+  directories - not a bulk directory wipe, since those may hold real
+  output from actual prior app usage. The Electron process was stopped
+  by exact PID after confirming (via `Win32_Process`, no `--type=`
+  helper-process flag) it was the main GUI process, not a child.

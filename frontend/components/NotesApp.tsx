@@ -24,6 +24,7 @@ import {
 } from "@/lib/api";
 import { fetchTranscriptClientSide } from "@/lib/transcript";
 import { isNativeMobile, savePdfOnMobile, type SavePdfResult } from "@/lib/downloadPdf";
+import { persistPdfLocally } from "@/lib/pdfStore";
 import MultiLinkInput from "./MultiLinkInput";
 import LanguageStylePicker from "./LanguageStylePicker";
 
@@ -94,6 +95,31 @@ function rateLimitCooldownMs(): number {
 }
 
 /**
+ * One step of "back" through this flow's own sub-navigation, as a pure
+ * function of the current view - the single source of truth both the
+ * visible back buttons below (input/multi-link/picker/confirm-chunks) and
+ * the component's registerBackHandler (hardware/gesture back button, see
+ * AppShell.tsx) call, so the two can never drift out of sync with each
+ * other. Views with no meaningful mid-flow "back" target (progress,
+ * batch-progress, done, error, checking-server, server-unreachable, and
+ * mode-choice itself, the root of this flow) return null - goBack() below
+ * bubbles those out to onBack (AppShell's "go to Home") instead.
+ */
+function previousView(current: View): View | null {
+  switch (current.kind) {
+    case "input":
+    case "multi-link":
+      return { kind: "mode-choice" };
+    case "picker":
+      return current.source.type === "single" ? { kind: "input" } : { kind: "multi-link" };
+    case "confirm-chunks":
+      return { kind: "picker", source: { type: "batch", payload: current.payload } };
+    default:
+      return null;
+  }
+}
+
+/**
  * Fetches transcripts client-side for every URL in a batch/playlist chunk,
  * one at a time, before the request ever reaches /generate - the batch
  * equivalent of what the single-video path already does via
@@ -134,17 +160,54 @@ interface NotesAppProps {
   // now (see AppShell.tsx), not the app's own default landing state, so it
   // needs its own way back out rather than being the root of everything.
   onBack?: () => void;
-  // Fired once, the moment a single-video/batch job's status first reports
-  // "done" - AppShell uses this to build its honestly session-only recent-
-  // activity list (see HomeScreen.tsx). Not fired per-chunk for a
-  // multi-chunk playlist batch (see the batch-progress polling effect) -
-  // out of scope for this restructure, which only touches the shell/nav,
-  // not the generation pipeline's own batch semantics.
-  onJobCompleted?: (summary: { jobId: string; title: string; pageCount?: number; completedAt: number }) => void;
+  // Fired once, the moment a single-video job's generated PDF has actually
+  // been persisted to durable on-device storage (see the PDF-fetch effect
+  // below and lib/pdfStore.ts) - not the earlier moment its /status first
+  // reports "done", so that by the time AppShell's session-activity list
+  // (see HomeScreen.tsx) can show this item, its detail screen's
+  // re-download/share already has a real local file to point at. Not fired
+  // per-chunk for a multi-chunk playlist batch (see the batch-progress
+  // polling effect) - out of scope for this restructure, which only
+  // touches the shell/nav, not the generation pipeline's own batch
+  // semantics.
+  onJobCompleted?: (summary: {
+    jobId: string;
+    title: string;
+    pageCount?: number;
+    completedAt: number;
+    sourceUrls: string[];
+    filename: string;
+    localPdfPath: string | null;
+  }) => void;
+  // True once AppShell's own splash-phase health check has already
+  // succeeded (see AppShell.tsx) - the server wake-up wait now lives there
+  // instead of a separate post-splash "connecting" state, so when this is
+  // true, this component skips straight to mode-choice instead of
+  // re-probing/re-flashing "checking-server" on every visit to this screen.
+  // Left undefined/false when AppShell's own check failed or hit its cap -
+  // this component's existing probe/retry/server-unreachable UI below is
+  // exactly the fallback that case is meant to hand off to.
+  initialServerHealthy?: boolean;
+  // Lets AppShell's hardware/gesture back-button wiring delegate into this
+  // component's own sub-navigation (see previousView/goBack) instead of
+  // always jumping straight to Home. Called with the current goBack
+  // function every time `view` changes (see the registration effect
+  // below), and with null on unmount - AppShell stores whatever it's most
+  // recently been called with in a ref and invokes it when Android's
+  // hardware back button fires.
+  registerBackHandler?: (handler: (() => void) | null) => void;
 }
 
-export default function NotesApp({ defaultLanguage, defaultStyleId, defaultQualityTier, onBack, onJobCompleted }: NotesAppProps = {}) {
-  const [view, setView] = useState<View>({ kind: "checking-server" });
+export default function NotesApp({
+  defaultLanguage,
+  defaultStyleId,
+  defaultQualityTier,
+  onBack,
+  onJobCompleted,
+  initialServerHealthy,
+  registerBackHandler,
+}: NotesAppProps = {}) {
+  const [view, setView] = useState<View>(initialServerHealthy ? { kind: "mode-choice" } : { kind: "checking-server" });
   const [url, setUrl] = useState("");
   const [urlError, setUrlError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -155,6 +218,14 @@ export default function NotesApp({ defaultLanguage, defaultStyleId, defaultQuali
   const [submitStatusLabel, setSubmitStatusLabel] = useState("Generating...");
 
   const pollFailuresRef = useRef(0);
+  // jobId -> the source video URL(s) used to start that job - only ever
+  // populated for the single-video path (see handleGenerate below), since
+  // onJobCompleted/the session activity list is itself single-video-only
+  // (same "not fired per-chunk for a multi-chunk playlist batch" scoping
+  // as before). Read back once the job's PDF is persisted (see the
+  // PDF-fetch effect) so the Home screen's session-detail view has a real
+  // source link to show, not just a title string.
+  const jobSourcesRef = useRef<Record<string, string[]>>({});
   const [cooldownRemainingMs, setCooldownRemainingMs] = useState(0);
   const [pdf, setPdf] = useState<
     | { status: "loading" }
@@ -166,8 +237,15 @@ export default function NotesApp({ defaultLanguage, defaultStyleId, defaultQuali
     status: "idle",
   });
 
-  // Initial "is the local server up" probe, then keep retrying until it is.
+  // Initial "is the server up" probe, then keep retrying until it is - only
+  // needed when AppShell hasn't already confirmed this (initialServerHealthy),
+  // since otherwise this would re-probe (and briefly flash "checking-server")
+  // every time the user re-enters this screen even though the server was
+  // already known healthy. If AppShell's own check *failed*, this still runs
+  // and is what actually recovers/surfaces "server-unreachable" - the AND-of-
+  // both-conditions guard below only skips this in the confirmed-healthy case.
   useEffect(() => {
+    if (initialServerHealthy) return;
     let cancelled = false;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -214,7 +292,10 @@ export default function NotesApp({ defaultLanguage, defaultStyleId, defaultQuali
         }
         if (status.stage === "done") {
           setView({ kind: "done", jobId, status });
-          onJobCompleted?.({ jobId, title: status.notesTitle || "Untitled notes", pageCount: status.pageCount, completedAt: Date.now() });
+          // onJobCompleted itself doesn't fire here - see the PDF-fetch
+          // effect below, which is where it now fires once the PDF is
+          // actually persisted locally (see jobSourcesRef's doc comment for
+          // why a single "done" status flip isn't the right moment).
           return;
         }
         setView({ kind: "progress", jobId, status, reconnecting: false });
@@ -369,10 +450,29 @@ export default function NotesApp({ defaultLanguage, defaultStyleId, defaultQuali
     setPdf({ status: "loading" });
     setMobileSave({ status: "idle" });
     fetchPdf(jobId)
-      .then(({ blob, filename }) => {
+      .then(async ({ blob, filename }) => {
         if (cancelled) return;
         objectUrl = URL.createObjectURL(blob);
         setPdf({ status: "ready", blob, blobUrl: objectUrl, filename });
+
+        // Persist to durable on-device storage before reporting this job
+        // "completed" to AppShell - see persistPdfLocally's own doc comment
+        // for why this is a real disk write, not just the in-memory blob
+        // above (which is gone the moment this view unmounts). A failed
+        // persist (localPdfPath: null) still reports completion - the
+        // session list entry just won't offer a working re-download/share,
+        // same graceful-degradation policy persistPdfLocally itself uses.
+        const persisted = await persistPdfLocally(jobId, filename, blob);
+        if (cancelled) return;
+        onJobCompleted?.({
+          jobId,
+          title: view.status.notesTitle || "Untitled notes",
+          pageCount: view.status.pageCount,
+          completedAt: Date.now(),
+          sourceUrls: jobSourcesRef.current[jobId] ?? [],
+          filename,
+          localPdfPath: persisted?.path ?? null,
+        });
       })
       .catch(() => {
         if (!cancelled) setPdf({ status: "error" });
@@ -383,6 +483,28 @@ export default function NotesApp({ defaultLanguage, defaultStyleId, defaultQuali
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [view.kind === "done" ? view.jobId : null, pdfRetryTick]);
+
+  // One "back" step - steps to the previous screen within this flow if
+  // previousView says there is one, otherwise bubbles out via onBack
+  // (AppShell's "go to Home"). Used by every visible back/cancel button
+  // below and, via the registration effect right after, by the hardware/
+  // gesture back button too - one function, so both can never disagree
+  // about what "back" means from any given view.
+  function goBack() {
+    const prev = previousView(view);
+    if (prev) setView(prev);
+    else onBack?.();
+  }
+
+  // Re-registers `goBack` with AppShell (see registerBackHandler's doc
+  // comment) every time `view` changes, so the ref AppShell's hardware-
+  // back listener reads from always calls back into *this* view's own
+  // goBack, not a stale closure over whatever view was active when this
+  // component first mounted.
+  useEffect(() => {
+    registerBackHandler?.(goBack);
+    return () => registerBackHandler?.(null);
+  }, [view]);
 
   // Named "toStart" rather than "toInput" since there's now a mode-choice
   // screen before the single-video input form - both "Try again" and
@@ -488,6 +610,7 @@ export default function NotesApp({ defaultLanguage, defaultStyleId, defaultQuali
         setSubmitStatusLabel("Starting...");
         const { jobId } = await generateNotes(source.url, clientTranscript, { language, styleId, qualityTier });
         pollFailuresRef.current = 0;
+        jobSourcesRef.current[jobId] = [source.url];
         setView({ kind: "progress", jobId, status: { stage: "queued", progress: 0, error: null }, reconnecting: false });
       } else if ("videoUrls" in source.payload) {
         const transcripts = await prefetchTranscripts(source.payload.videoUrls, setSubmitStatusLabel);
@@ -561,7 +684,7 @@ export default function NotesApp({ defaultLanguage, defaultStyleId, defaultQuali
     <div className={styles.page}>
       <div className={styles.brand}>
         <span className={styles.brandMark}>
-          hisarchives / <strong>notesify</strong>
+          <strong>notesify</strong>
         </span>
         {onBack && (
           <button type="button" className={styles.linkButton} onClick={onBack} style={{ marginLeft: "auto" }}>
@@ -618,11 +741,14 @@ export default function NotesApp({ defaultLanguage, defaultStyleId, defaultQuali
         )}
 
         {view.kind === "multi-link" && (
-          <MultiLinkInput onBack={() => setView({ kind: "mode-choice" })} onSubmit={handleBatchNext} submitting={false} />
+          <MultiLinkInput onBack={goBack} onSubmit={handleBatchNext} submitting={false} />
         )}
 
         {view.kind === "input" && (
           <form onSubmit={handleSubmit}>
+            <button type="button" className={styles.linkButton} onClick={goBack} style={{ marginBottom: 16 }}>
+              &lsaquo; Back
+            </button>
             <p className={styles.title}>Generate handwritten notes</p>
             <p className={styles.subtitle}>Paste a YouTube lecture link and get exam-ready notebook-style PDF notes.</p>
 
@@ -660,7 +786,7 @@ export default function NotesApp({ defaultLanguage, defaultStyleId, defaultQuali
 
         {view.kind === "picker" && (
           <LanguageStylePicker
-            onBack={() => setView(view.source.type === "single" ? { kind: "input" } : { kind: "multi-link" })}
+            onBack={goBack}
             onGenerate={(language, styleId, qualityTier) => handleGenerate(view.source, language, styleId, qualityTier)}
             submitting={submitting}
             submitLabel={submitStatusLabel}
@@ -693,12 +819,7 @@ export default function NotesApp({ defaultLanguage, defaultStyleId, defaultQuali
               >
                 {submitting ? submitStatusLabel : `Confirm & generate ${view.plan.chunkCount} PDFs`}
               </button>
-              <button
-                type="button"
-                className={styles.linkButton}
-                disabled={submitting}
-                onClick={() => setView({ kind: "picker", source: { type: "batch", payload: view.payload } })}
-              >
+              <button type="button" className={styles.linkButton} disabled={submitting} onClick={goBack}>
                 Cancel
               </button>
             </div>

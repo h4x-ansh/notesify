@@ -455,6 +455,21 @@ export function looksLikeYoutubeUrl(value: string): boolean {
 }
 
 /**
+ * Pulls the 11-char video ID out of any of YouTube's standard single-video
+ * URL shapes (watch?v=, youtu.be/, /shorts/) - used to build the
+ * https://img.youtube.com/vi/{id}/hqdefault.jpg thumbnail URL on the
+ * session-detail screen. Returns null for anything else (playlist-only
+ * URLs, malformed input) - the detail screen skips the thumbnail entirely
+ * in that case rather than guessing.
+ */
+export function extractYoutubeVideoId(url: string): string | null {
+  const match = url
+    .trim()
+    .match(/(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)([\w-]{11})/i);
+  return match ? match[1] : null;
+}
+
+/**
  * Best-effort detection of Gemini rate-limit/quota failures from the error
  * message string surfaced by /status. No backend contract for this - just
  * pattern matching on the text Gemini's SDK/API typically produces for a 429.

@@ -17,7 +17,7 @@ export function isNativeMobile(): boolean {
   return Capacitor.isNativePlatform();
 }
 
-function blobToBase64(blob: Blob): Promise<string> {
+export function blobToBase64(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onloadend = () => {
