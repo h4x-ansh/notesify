@@ -12,4 +12,10 @@ const { contextBridge, ipcRenderer } = require("electron");
 // frontend/lib/transcript.ts's window.notesifyBridge usage.
 contextBridge.exposeInMainWorld("notesifyBridge", {
   fetchTranscript: (youtubeUrl) => ipcRenderer.invoke("fetch-transcript", youtubeUrl),
+  // Local settings persistence (default language/style/quality tier - see
+  // frontend/lib/settings.ts) - Electron's own equivalent of the
+  // @capacitor/preferences plugin the mobile/web build uses, since that's
+  // a Capacitor-only plugin with no meaning in a plain Electron shell.
+  getSetting: (key) => ipcRenderer.invoke("get-setting", key),
+  setSetting: (key, value) => ipcRenderer.invoke("set-setting", key, value),
 });

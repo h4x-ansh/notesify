@@ -1,21 +1,52 @@
 :root {
-  --bg: #0a0b0d;
-  --bg-elevated: #131519;
-  --bg-input: #0e0f12;
-  --border: #24262c;
-  --border-hover: #35373f;
-  --text: #ede9e0;
-  --text-dim: #8b8d94;
-  --text-faint: #56585f;
-  --accent: #f2b84b;
-  --accent-dim: #7a5f28;
-  --danger: #f0685c;
-  --danger-bg: #241414;
-  --success: #6fcf97;
-  --font-sans:
-    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --font-mono:
-    ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+  /* Stationery design system - the actual named palette (task spec). Kept
+     as their own tokens, not just baked into the semantic aliases below,
+     so any new component can reach for the literal palette name directly
+     (e.g. a highlight chip that wants --highlight-yellow specifically,
+     not whatever --accent happens to be aliased to). */
+  --paper: #f7f3e9;
+  --ink-navy: #1a2744;
+  --marker-red: #a8324a;
+  --highlight-yellow: #f5dc7a;
+  --pencil-grey: #8a8578;
+
+  /* Semantic aliases - every existing screen (NotesApp.module.css and the
+     components that share it) already reads colors exclusively through
+     these token names, not hardcoded hex, so redefining the *values* here
+     is what carries the stationery identity through the whole app,
+     including screens this restructure doesn't otherwise touch. */
+  --bg: var(--paper);
+  --bg-elevated: #fffdf7;
+  --bg-input: #fffbf2;
+  --border: #ddd3ba;
+  --border-hover: #c7b998;
+  --text: var(--ink-navy);
+  --text-dim: var(--pencil-grey);
+  --text-faint: #b3ac9c;
+  --accent: var(--marker-red);
+  --accent-dim: #7a2436;
+  /* Text color to place ON a solid --accent/--success fill - the paper
+     tokens above are all fairly saturated/dark, unlike the old theme's
+     bright amber accent, so a dark-on-accent pairing (the old hardcoded
+     `#1a1305`/`#06240f` in NotesApp.module.css) would read low-contrast. */
+  --accent-on: #fdf8ee;
+  --highlight: var(--highlight-yellow);
+  --danger: #b3261e;
+  --danger-bg: #fbeceb;
+  --success: #2f6f4e;
+  --success-on: #f3faf6;
+
+  /* Soft, warm, low-spread shadow - a physical object resting on a desk,
+     not a flat corporate card's crisp drop shadow. */
+  --shadow-paper: 0 1px 2px rgba(26, 39, 68, 0.06), 0 8px 20px rgba(26, 39, 68, 0.09);
+
+  /* UI chrome font (Inter, loaded via next/font in layout.tsx) - the
+     workhorse everywhere: buttons, labels, body text. --font-hand (Kalam)
+     is reserved for the app name/headers specifically, used sparingly by
+     design - see AppShell.module.css. */
+  --font-sans: var(--next-font-ui), ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+  --font-hand: var(--next-font-hand), "Kalam", cursive;
 }
 
 * {
@@ -30,8 +61,14 @@ body {
 
 body {
   background-color: var(--bg);
-  background-image: radial-gradient(circle, #1a1c20 1px, transparent 1px);
-  background-size: 24px 24px;
+  /* A faint paper grain rather than the old theme's dark radial-dot grid -
+     a single inline SVG feTurbulence filter, low opacity, no image asset
+     to ship. Same idea as the PDF template's own scanned-paper texture
+     (src/templates/noiseTexture.js) but generated live instead of
+     pre-rasterized, since this only ever needs to look right on-screen,
+     not survive print/PDF rendering. */
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix type='saturate' values='0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)' opacity='0.035'/></svg>");
+  background-repeat: repeat;
   color: var(--text);
   font-family: var(--font-sans);
   min-height: 100vh;
@@ -47,6 +84,6 @@ button {
 }
 
 ::selection {
-  background: var(--accent-dim);
-  color: var(--text);
+  background: var(--highlight);
+  color: var(--ink-navy);
 }

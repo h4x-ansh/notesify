@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain } from "electron";
 import { spawn } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { existsSync, appendFileSync, mkdirSync } from "node:fs";
+import { existsSync, appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import dotenv from "dotenv";
 import express from "express";
 import { fetchCaptionsOnly } from "../src/transcript.js";
@@ -145,6 +145,42 @@ ipcMain.handle("fetch-transcript", async (_event, youtubeUrl) => {
     log("[fetch-transcript IPC] failed:", err?.message || String(err));
     return null;
   }
+});
+
+// Local settings persistence (default language/style/quality tier - see
+// frontend/lib/settings.ts and electron/preload.cjs's matching bridge
+// methods) - a flat JSON file under the same userData directory main.log
+// already lives in, read/written whole rather than per-key (this only
+// ever holds one small object, not worth a real key-value store). Kept
+// entirely in the main process rather than handing the renderer direct
+// filesystem access, same reasoning as fetch-transcript above.
+const settingsFilePath = path.join(logDir, "settings.json");
+
+function readSettingsFile() {
+  try {
+    return JSON.parse(readFileSync(settingsFilePath, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function writeSettingsFile(data) {
+  try {
+    writeFileSync(settingsFilePath, JSON.stringify(data), "utf8");
+  } catch (err) {
+    log("[set-setting IPC] failed to write settings.json:", err?.message || String(err));
+  }
+}
+
+ipcMain.handle("get-setting", (_event, key) => {
+  const data = readSettingsFile();
+  return Object.prototype.hasOwnProperty.call(data, key) ? data[key] : null;
+});
+
+ipcMain.handle("set-setting", (_event, key, value) => {
+  const data = readSettingsFile();
+  data[key] = value;
+  writeSettingsFile(data);
 });
 
 let backendProcess = null;

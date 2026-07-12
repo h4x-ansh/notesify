@@ -123,7 +123,27 @@ async function prefetchTranscripts(
   return transcripts;
 }
 
-export default function NotesApp() {
+interface NotesAppProps {
+  // Pre-fills the language/style/quality picker's initial selection (see
+  // Settings, lib/settings.ts) - still freely changeable per generation,
+  // this only saves re-picking the same defaults every time.
+  defaultLanguage?: Language;
+  defaultStyleId?: string;
+  defaultQualityTier?: QualityTier;
+  // Returns to AppShell's Home screen - this flow is launched *from* Home
+  // now (see AppShell.tsx), not the app's own default landing state, so it
+  // needs its own way back out rather than being the root of everything.
+  onBack?: () => void;
+  // Fired once, the moment a single-video/batch job's status first reports
+  // "done" - AppShell uses this to build its honestly session-only recent-
+  // activity list (see HomeScreen.tsx). Not fired per-chunk for a
+  // multi-chunk playlist batch (see the batch-progress polling effect) -
+  // out of scope for this restructure, which only touches the shell/nav,
+  // not the generation pipeline's own batch semantics.
+  onJobCompleted?: (summary: { jobId: string; title: string; pageCount?: number; completedAt: number }) => void;
+}
+
+export default function NotesApp({ defaultLanguage, defaultStyleId, defaultQualityTier, onBack, onJobCompleted }: NotesAppProps = {}) {
   const [view, setView] = useState<View>({ kind: "checking-server" });
   const [url, setUrl] = useState("");
   const [urlError, setUrlError] = useState<string | null>(null);
@@ -194,6 +214,7 @@ export default function NotesApp() {
         }
         if (status.stage === "done") {
           setView({ kind: "done", jobId, status });
+          onJobCompleted?.({ jobId, title: status.notesTitle || "Untitled notes", pageCount: status.pageCount, completedAt: Date.now() });
           return;
         }
         setView({ kind: "progress", jobId, status, reconnecting: false });
@@ -542,6 +563,11 @@ export default function NotesApp() {
         <span className={styles.brandMark}>
           hisarchives / <strong>notesify</strong>
         </span>
+        {onBack && (
+          <button type="button" className={styles.linkButton} onClick={onBack} style={{ marginLeft: "auto" }}>
+            &lsaquo; Home
+          </button>
+        )}
       </div>
 
       <div className={styles.card}>
@@ -638,6 +664,9 @@ export default function NotesApp() {
             onGenerate={(language, styleId, qualityTier) => handleGenerate(view.source, language, styleId, qualityTier)}
             submitting={submitting}
             submitLabel={submitStatusLabel}
+            defaultLanguage={defaultLanguage}
+            defaultStyleId={defaultStyleId}
+            defaultQualityTier={defaultQualityTier}
           />
         )}
 

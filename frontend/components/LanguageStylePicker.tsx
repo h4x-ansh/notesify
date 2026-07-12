@@ -9,6 +9,13 @@ interface LanguageStylePickerProps {
   onGenerate: (language: Language, styleId: string, qualityTier: QualityTier) => void;
   submitting: boolean;
   submitLabel?: string;
+  // Initial selection, from Settings (see lib/settings.ts) - falls back to
+  // the same hardcoded defaults as before Settings existed when unset, so
+  // this stays a fully optional prop, not a breaking change to this
+  // component's own contract.
+  defaultLanguage?: Language;
+  defaultStyleId?: string;
+  defaultQualityTier?: QualityTier;
 }
 
 // Short, plain-language hint per tier - "High/Normal/Low" alone doesn't
@@ -28,10 +35,18 @@ const QUALITY_TIER_HINTS: Record<QualityTier, string> = {
  * NotesApp.tsx's handleGenerate, which is where the client-side transcript
  * pre-fetch and the real generateNotes/generateNotesBatch calls now live).
  */
-export default function LanguageStylePicker({ onBack, onGenerate, submitting, submitLabel = "Generate Notes" }: LanguageStylePickerProps) {
-  const [language, setLanguage] = useState<Language>("English");
-  const [styleId, setStyleId] = useState<string>(STYLE_PRESETS[0].id);
-  const [qualityTier, setQualityTier] = useState<QualityTier>("Normal");
+export default function LanguageStylePicker({
+  onBack,
+  onGenerate,
+  submitting,
+  submitLabel = "Generate Notes",
+  defaultLanguage,
+  defaultStyleId,
+  defaultQualityTier,
+}: LanguageStylePickerProps) {
+  const [language, setLanguage] = useState<Language>(defaultLanguage ?? "English");
+  const [styleId, setStyleId] = useState<string>(defaultStyleId ?? STYLE_PRESETS[0].id);
+  const [qualityTier, setQualityTier] = useState<QualityTier>(defaultQualityTier ?? "Normal");
 
   return (
     <div>

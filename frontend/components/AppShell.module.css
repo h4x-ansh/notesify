@@ -1,0 +1,398 @@
+/* Shell layout - the bottom tab bar is fixed, so the scrollable screen
+   area needs bottom padding to clear it rather than sitting underneath. */
+.shellRoot {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
+.screenArea {
+  flex: 1;
+  overflow-y: auto;
+  padding-bottom: calc(76px + env(safe-area-inset-bottom, 0px));
+}
+
+/* ---------- Splash ---------- */
+
+.splashRoot {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  background-color: var(--bg);
+}
+
+.splashWordmarkWrap {
+  position: relative;
+  display: inline-block;
+}
+
+.splashWordmark {
+  font-family: var(--font-hand);
+  font-weight: 700;
+  font-size: 44px;
+  color: var(--ink-navy);
+  letter-spacing: 0.5px;
+  /* The "pen writing it in" effect - the wordmark itself is revealed
+     left-to-right via an animated clip-path, like ink actually filling in
+     the letters, rather than a generic fade/spinner. */
+  clip-path: inset(0 100% 0 0);
+  animation: ink-reveal 900ms cubic-bezier(0.65, 0, 0.35, 1) forwards;
+  animation-delay: 150ms;
+}
+
+.splashPen {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  color: var(--marker-red);
+  transform: translate(-4px, -50%) rotate(28deg);
+  animation: pen-travel 900ms cubic-bezier(0.65, 0, 0.35, 1) forwards;
+  animation-delay: 150ms;
+  opacity: 0;
+}
+
+@keyframes ink-reveal {
+  0% {
+    clip-path: inset(0 100% 0 0);
+  }
+  100% {
+    clip-path: inset(0 0 0 0);
+  }
+}
+
+@keyframes pen-travel {
+  0% {
+    left: 0;
+    opacity: 1;
+  }
+  95% {
+    opacity: 1;
+  }
+  100% {
+    left: 100%;
+    opacity: 0;
+  }
+}
+
+.splashCaption {
+  font-size: 12px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--pencil-grey);
+  opacity: 0;
+  animation: fade-in 400ms ease forwards;
+  animation-delay: 700ms;
+}
+
+@keyframes fade-in {
+  to {
+    opacity: 1;
+  }
+}
+
+/* ---------- Bottom nav ---------- */
+
+.navBar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  justify-content: space-around;
+  background: var(--bg-elevated);
+  border-top: 1px solid var(--border);
+  box-shadow: 0 -4px 16px rgba(26, 39, 68, 0.06);
+  padding: 8px 8px calc(8px + env(safe-area-inset-bottom, 0px));
+  z-index: 50;
+}
+
+.navItem {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: none;
+  padding: 6px 18px;
+  min-width: 64px;
+  color: var(--pencil-grey);
+  cursor: pointer;
+  border-radius: 10px;
+  transition: color 0.15s ease, background-color 0.15s ease;
+}
+
+.navItem:hover {
+  background: var(--bg-input);
+}
+
+.navItemActive {
+  color: var(--marker-red);
+}
+
+.navLabel {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.navDot {
+  width: 4px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--highlight-yellow);
+  margin-top: 1px;
+}
+
+/* ---------- Home ---------- */
+
+.homeRoot {
+  max-width: 560px;
+  margin: 0 auto;
+  padding: 48px 20px 24px;
+}
+
+@media (max-width: 480px) {
+  .homeRoot {
+    padding: 32px 16px 16px;
+  }
+}
+
+.homeHeader {
+  margin-bottom: 28px;
+}
+
+.homeWordmark {
+  font-family: var(--font-hand);
+  font-weight: 700;
+  font-size: 30px;
+  color: var(--ink-navy);
+  margin: 0 0 4px;
+}
+
+.homeTagline {
+  font-size: 13px;
+  color: var(--pencil-grey);
+  margin: 0;
+}
+
+.newNotesCard {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  width: 100%;
+  text-align: left;
+  background: var(--ink-navy);
+  color: var(--paper);
+  border: none;
+  border-radius: 16px;
+  padding: 22px 20px;
+  cursor: pointer;
+  box-shadow: var(--shadow-paper);
+  transition: transform 0.12s ease, opacity 0.15s ease;
+}
+
+.newNotesCard:hover {
+  opacity: 0.94;
+}
+
+.newNotesCard:active {
+  transform: scale(0.99);
+}
+
+.newNotesIcon {
+  flex-shrink: 0;
+  width: 46px;
+  height: 46px;
+  border-radius: 12px;
+  background: var(--marker-red);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent-on);
+}
+
+.newNotesTitle {
+  font-size: 17px;
+  font-weight: 700;
+  margin: 0 0 2px;
+}
+
+.newNotesSubtitle {
+  font-size: 12.5px;
+  color: rgba(247, 243, 233, 0.72);
+  margin: 0;
+  line-height: 1.4;
+}
+
+.sectionLabel {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--pencil-grey);
+  margin: 32px 0 12px;
+}
+
+.recentList {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.recentItem {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px 16px;
+  box-shadow: var(--shadow-paper);
+}
+
+.recentIcon {
+  flex-shrink: 0;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
+  background: var(--highlight-yellow);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--ink-navy);
+}
+
+.recentTitle {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0 0 2px;
+  word-break: break-word;
+}
+
+.recentMeta {
+  font-size: 11.5px;
+  color: var(--pencil-grey);
+  margin: 0;
+}
+
+.emptyState {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  text-align: center;
+  padding: 28px 16px;
+  background: var(--bg-input);
+  border: 1px dashed var(--border-hover);
+  border-radius: 12px;
+  color: var(--pencil-grey);
+}
+
+.emptyState p {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+/* ---------- Settings ---------- */
+
+.settingsRoot {
+  max-width: 560px;
+  margin: 0 auto;
+  padding: 48px 20px 24px;
+}
+
+@media (max-width: 480px) {
+  .settingsRoot {
+    padding: 32px 16px 16px;
+  }
+}
+
+.settingsSection {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 20px;
+  margin-bottom: 18px;
+  box-shadow: var(--shadow-paper);
+}
+
+.settingsSectionTitle {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+  margin: 0 0 4px;
+}
+
+.settingsSectionHint {
+  font-size: 12px;
+  color: var(--pencil-grey);
+  margin: 0 0 16px;
+  line-height: 1.5;
+}
+
+.savedBadge {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--success);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.byokRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  background: var(--bg-input);
+  border: 1px dashed var(--border-hover);
+  border-radius: 10px;
+}
+
+.byokLabel {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.comingSoonBadge {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--pencil-grey);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 10px;
+  white-space: nowrap;
+}
+
+.aboutRow {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12.5px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.aboutRow:last-child {
+  border-bottom: none;
+}
+
+.aboutKey {
+  color: var(--pencil-grey);
+}
+
+.aboutValue {
+  color: var(--text);
+  font-weight: 600;
+}

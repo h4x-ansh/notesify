@@ -21,11 +21,19 @@ export interface ClientTranscriptResult {
 // Electron's renderer exposes this via electron/preload.cjs +
 // contextBridge - see fetchTranscriptClientSide below for why Electron
 // can't just call YoutubeTranscript.fetchTranscript() directly like the
-// mobile build does.
+// mobile build does. `getSetting`/`setSetting` are the same bridge object,
+// added for local settings persistence - see lib/settings.ts, which is the
+// only other consumer of this global. Declared once here (TypeScript's
+// `declare global` merges across files, but only if the *shape* of a given
+// property matches everywhere it's declared) rather than re-declared per
+// consumer, so there's exactly one source of truth for what the bridge
+// actually exposes.
 declare global {
   interface Window {
     notesifyBridge?: {
       fetchTranscript: (youtubeUrl: string) => Promise<ClientTranscriptResult | null>;
+      getSetting?: (key: string) => Promise<string | null>;
+      setSetting?: (key: string, value: string) => Promise<void>;
     };
   }
 }

@@ -1925,3 +1925,124 @@ content, just not on the allegation section specifically:
   this change, and nothing here removes or alters any of Flash's existing
   instructions, there's no mechanism by which this could regress its
   already-correct behavior.
+
+## App shell restructure: real navigation + a distinctive stationery identity
+
+The frontend used to be one linear flow - `app/page.tsx` rendered
+`<NotesApp/>` directly, and its own internal `View` state machine (mode-
+choice -> picker -> progress -> done) *was* the entire app, starting the
+instant it loaded. This restructures it into a real navigating app -
+splash, Home, a bottom tab bar, Settings - with the generate flow now
+something launched *from* Home, not the app's default landing state.
+Pure frontend shell + design work - the generation pipeline, backend, and
+today's content-safety/fallback-chain logic are untouched.
+
+**Design system** (`frontend/app/globals.css`): a warm-paper "stationery"
+palette (`--paper #f7f3e9`, `--ink-navy #1a2744`, `--marker-red #a8324a`,
+`--highlight-yellow #f5dc7a`, `--pencil-grey #8a8578`), replacing the old
+dark amber-accent theme. Rather than rewriting every component's CSS,
+this redefines the *values* of the semantic tokens (`--bg`, `--text`,
+`--accent`, etc.) that `NotesApp.module.css` and its dependents
+(`LanguageStylePicker`, `MultiLinkInput`) already consumed exclusively -
+confirmed via a full grep for hardcoded hex colors first, which found
+exactly two (`.buttonPrimary`/`.doneCheck` text colors), fixed to new
+`--accent-on`/`--success-on` tokens for contrast against the darker new
+accent. This is what "carries the palette through everywhere" without
+touching the existing flow's own styling. Inter (self-hosted via
+`next/font/google`) is the UI-chrome font everywhere; Kalam (the same
+handwriting font the generated-notes PDF template uses) is reserved for
+the app name/headers specifically, not applied wholesale - deliberately
+sparing, per spec. A `--shadow-paper` token gives cards/screens a soft,
+warm, low-spread shadow (a physical object on a desk) instead of a flat
+corporate drop-shadow, and `body` gets a faint inline-SVG paper-grain
+texture instead of the old dark radial-dot grid.
+
+**Splash** (`SplashScreen.tsx`): the app name reveals via an animated
+`clip-path` (ink filling in the letters left-to-right) with a small pen
+icon traveling along the reveal edge - a notebook-idiom "pen writing the
+name in," not a generic spinner. `AppShell.tsx` owns the actual timing:
+`Promise.all([loadSettings(), delay(550ms)])` - real init work (loading
+persisted defaults) races against a floor delay, so a slow settings read
+doesn't cut the animation short and a fast one doesn't linger.
+
+**Home** (`HomeScreen.tsx`, the new default landing screen): a prominent
+navy "New Notes" card as the primary action, and a "This session" list
+built entirely from real session state (`AppShell`'s `recentActivity`,
+appended via a new `onJobCompleted` prop on `NotesApp` fired exactly when
+a job's status first reports "done") - not persisted anywhere, so an empty
+session honestly shows an empty-state message rather than fake data, and
+restarting the app naturally clears it (full history/persistence was
+explicitly out of scope for this pass).
+
+**Navigation** (`BottomNav.tsx`): a fixed, thumb-reachable bottom tab bar
+(Home / New Notes / Settings, `lucide-react` icons - `Home`,
+`NotebookPen`, `Settings`) styled with the ink/paper palette via
+`currentColor` (pencil-grey inactive, marker-red active plus a small
+highlight-yellow dot), not a default Material blue. Respects
+`env(safe-area-inset-bottom)` for Android's gesture nav bar.
+
+**Settings** (`SettingsScreen.tsx`, new screen): default language/style/
+quality-tier pickers (reusing the exact same options and toggle-button
+styling as the existing `LanguageStylePicker`), persisted via a new
+`frontend/lib/settings.ts` and read back as `NotesApp`'s
+`defaultLanguage`/`defaultStyleId`/`defaultQualityTier` props (still
+freely changeable per generation - this only pre-fills the picker's
+initial selection). An About/version block, and a BYOK (bring-your-own-
+API-key) section that's visually present but honestly labeled "Coming
+soon" - no key input exists anywhere in this app yet, and this doesn't
+pretend otherwise.
+
+**Settings persistence, two backends** (mirrors the exact branch pattern
+`lib/transcript.ts` already established for `window.notesifyBridge`):
+- **Capacitor/Android and plain-browser dev**: `@capacitor/preferences`
+  (`^7.0.4` - the latest major requires Capacitor core 8, this project is
+  pinned to 7.x for Node 20 compatibility, see `frontend/scripts/build-mobile.mjs`'s
+  own history) directly - it ships its own web implementation backed by
+  `localStorage`, so the same code path works whether or not this is
+  actually running in a native WebView.
+- **Electron**: no native Capacitor layer exists there, so a second pair
+  of `notesifyBridge` methods (`getSetting`/`setSetting`) was added
+  alongside the existing `fetchTranscript` one, backed by a new
+  `ipcMain.handle` pair in `electron/main.js` that reads/writes a flat
+  `settings.json` under the same `userData` directory `main.log` already
+  lives in - no new persistence dependency needed on the Electron side.
+
+**Existing flow, wired in rather than replaced**: `NotesApp.tsx` gained an
+optional `onBack` prop rendering a "‹ Home" link in its own brand row
+(visible throughout the whole flow, not just at its root) - the flow is
+launched *from* Home/the nav bar's "New Notes" tab now, so it needs its
+own way back out, unlike its old always-the-root existence. Its internal
+`View` state machine (mode-choice -> input/multi-link -> picker ->
+progress -> done/error) is otherwise completely unchanged.
+
+**Verified with real screenshots and real interaction, both viewport
+sizes - not assumed:**
+- **Every new screen screenshotted at desktop (1280×900) and phone
+  (390×844)**: splash (caught mid-animation via aggressive polling,
+  confirming the ink-reveal/pen-travel effect actually renders, not just
+  compiles), Home (both empty-session and with-real-activity states),
+  Settings, and the existing generate flow's mode-choice screen showing
+  the new "‹ Home" link and the palette correctly carried through with
+  zero changes to that screen's own code.
+- **Real end-to-end generate flow launched from Home**: clicked the "New
+  Notes" card, went through the real single-video flow with a real
+  YouTube URL, and a **real job completed** ("page(s) rendered" in the
+  live DOM, not mocked) - confirmed the flow works launched from the new
+  entry point, not just structurally present.
+- **Confirmed Home reflects real session state**: navigated back to Home
+  after that real job finished and confirmed the "This session" list
+  showed the actual completed job's real title/page count, not the
+  empty-state message - `onJobCompleted` firing and `recentActivity`
+  updating both confirmed working end to end, not just wired in isolation.
+- **Real settings persistence across an actual reload** (the real test the
+  task called for, not assumed): changed all three defaults (language to
+  Hindi, style to Cool Tones, quality to Low) on the Settings screen, did
+  a real `page.reload()` (a fresh JS execution reading from whatever
+  storage backend actually persisted the write - the same thing a real
+  app relaunch would do for this SPA), reopened Settings, and confirmed
+  all three values came back exactly as set - not defaults. Then went a
+  step further and confirmed the *picker screen itself* (not just the
+  Settings screen redisplaying its own state) initialized with those same
+  persisted values as its starting selection, proving the defaults
+  actually flow through to affect a real generation, not just echo back
+  on the settings page that set them.

@@ -1,5 +1,5 @@
-import NotesApp from "@/components/NotesApp";
+import AppShell from "@/components/AppShell";
 
 export default function Home() {
-  return <NotesApp />;
+  return <AppShell />;
 }
